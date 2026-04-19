@@ -164,6 +164,27 @@ def init_db() -> None:
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # インデックス: 主要な WHERE / JOIN / ORDER BY カラムをカバー。
+        # CREATE INDEX IF NOT EXISTS なので既存DBにも起動時に適用される。
+        for idx_sql in (
+            "CREATE INDEX IF NOT EXISTS ix_sessions_user_status "
+            "  ON sessions(user_id, status, id DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_session_images_session "
+            "  ON session_images(session_id, id)",
+            "CREATE INDEX IF NOT EXISTS ix_learning_records_session "
+            "  ON learning_records(session_id, status)",
+            "CREATE INDEX IF NOT EXISTS ix_learning_records_user "
+            "  ON learning_records(user_id, status, created_at)",
+            "CREATE INDEX IF NOT EXISTS ix_question_attempts_lr "
+            "  ON question_attempts(learning_record_id)",
+            "CREATE INDEX IF NOT EXISTS ix_question_attempts_topic "
+            "  ON question_attempts(topic_id, is_correct, attempted_at)",
+            "CREATE INDEX IF NOT EXISTS ix_review_queue_user "
+            "  ON review_queue(user_id, status, scheduled_for)",
+            "CREATE INDEX IF NOT EXISTS ix_exchanges_user_status "
+            "  ON exchanges(user_id, status, id)",
+        ):
+            conn.execute(idx_sql)
 
 
 # ── DB helpers ───────────────────────────────────────────────────────────────
