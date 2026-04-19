@@ -554,6 +554,100 @@ except Exception as e:
 
 
 # ─────────────────────────────────────────────
+print("\n=== P1-2. 交換承認のトランザクション整合性 ===")
+try:
+    P12_USER = "U_p12_child"
+    with sqlite3.connect(TEST_DB) as c:
+        c.execute("DELETE FROM exchanges WHERE user_id=?", (P12_USER,))
+        c.execute("DELETE FROM credits WHERE user_id=?", (P12_USER,))
+        c.execute("INSERT INTO credits (user_id, balance) VALUES (?, ?)", (P12_USER, 100))
+        c.execute("INSERT INTO exchanges (user_id, prize_name, cost, status) VALUES (?, ?, ?, 'pending')",
+                  (P12_USER, "P12景品A", 50))
+        c.execute("INSERT INTO exchanges (user_id, prize_name, cost, status) VALUES (?, ?, ?, 'pending')",
+                  (P12_USER, "P12景品B", 80))
+        ex_a_id = c.execute("SELECT id FROM exchanges WHERE user_id=? AND prize_name='P12景品A'",
+                            (P12_USER,)).fetchone()[0]
+        ex_b_id = c.execute("SELECT id FROM exchanges WHERE user_id=? AND prize_name='P12景品B'",
+                            (P12_USER,)).fetchone()[0]
+
+    # ケース1: 承認を連続2回 → 2回目は None、残高は 1回分のみ差引
+    r1 = bot.approve_exchange_if_pending(ex_a_id, P12_USER)
+    assert r1 is not None and r1["status"] == "approved", f"1回目承認失敗: {r1}"
+    assert r1["new_balance"] == 50, f"残高不正: {r1['new_balance']}"
+    r1_dup = bot.approve_exchange_if_pending(ex_a_id, P12_USER)
+    assert r1_dup is None, f"二重承認が通ってしまった: {r1_dup}"
+    with sqlite3.connect(TEST_DB) as c:
+        bal = c.execute("SELECT balance FROM credits WHERE user_id=?", (P12_USER,)).fetchone()[0]
+    assert bal == 50, f"二重承認でクレジットが二重差引された: balance={bal}"
+    ok("二重承認で差引は 1 回のみ")
+
+    # ケース2: 残高不足 → pending のまま、reason=insufficient_balance
+    r2 = bot.approve_exchange_if_pending(ex_b_id, P12_USER)
+    assert r2 is not None, "残高不足時に None 返却 (区別できない)"
+    assert r2.get("reason") == "insufficient_balance", f"reason不正: {r2}"
+    assert r2["balance"] == 50 and r2["cost"] == 80
+    with sqlite3.connect(TEST_DB) as c:
+        status = c.execute("SELECT status FROM exchanges WHERE id=?", (ex_b_id,)).fetchone()[0]
+        bal = c.execute("SELECT balance FROM credits WHERE user_id=?", (P12_USER,)).fetchone()[0]
+    assert status == "pending", f"残高不足なのに {status} に遷移"
+    assert bal == 50, f"残高不足時に balance が変わった: {bal}"
+    ok("残高不足は pending のまま、balance 不変")
+
+    # ケース3: finalize_grading の原子性 — 途中で RuntimeError を起こす
+    #   apply_grading_results 成功後、update_topic_mastery を monkeypatch で失敗させ、
+    #   learning_records.status / credits.balance の更新がすべて巻き戻ることを確認
+    with sqlite3.connect(TEST_DB) as c:
+        c.execute("INSERT INTO credits (user_id, balance) VALUES (?, ?) "
+                  "ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance",
+                  ("U_p12_atomic", 0))
+        sid = c.execute(
+            "INSERT INTO sessions (user_id) VALUES (?)", ("U_p12_atomic",),
+        ).lastrowid
+        tid = c.execute(
+            "INSERT INTO topics (subject, unit) VALUES ('算数', 'atomic_test')"
+        ).lastrowid
+        lr_id = c.execute(
+            "INSERT INTO learning_records (session_id, topic_id, user_id, status) "
+            "VALUES (?, ?, ?, 'grading')",
+            (sid, tid, "U_p12_atomic"),
+        ).lastrowid
+
+    orig = bot.update_topic_mastery
+    def boom(*a, **kw):
+        raise RuntimeError("simulated mid-transaction failure")
+    bot.update_topic_mastery = boom
+    try:
+        raised = False
+        try:
+            bot.finalize_grading(
+                user_id="U_p12_atomic", default_topic_id=tid, learning_record_id=lr_id,
+                questions=[{"q": "1+1", "a": "2", "type": "calc", "origin": "today"}],
+                results=[{"correct": True, "student_answer": "2"}],
+                credit_per_correct=5,
+            )
+        except RuntimeError:
+            raised = True
+        assert raised, "RuntimeError が伝播しなかった"
+    finally:
+        bot.update_topic_mastery = orig
+
+    with sqlite3.connect(TEST_DB) as c:
+        lr_status = c.execute("SELECT status FROM learning_records WHERE id=?", (lr_id,)).fetchone()[0]
+        bal = c.execute("SELECT balance FROM credits WHERE user_id=?", ("U_p12_atomic",)).fetchone()[0]
+        qa_n = c.execute("SELECT COUNT(*) FROM question_attempts WHERE learning_record_id=?",
+                         (lr_id,)).fetchone()[0]
+    assert lr_status == "grading", f"learning_record が done に遷移してしまった: {lr_status}"
+    assert bal == 0, f"途中失敗でもクレジットが加算された: {bal}"
+    assert qa_n == 0, f"途中失敗でも question_attempts が残った: {qa_n}"
+    ok("finalize_grading 途中失敗で全変更がロールバック")
+
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    ng("P1-2 トランザクション整合性", str(e))
+
+
+# ─────────────────────────────────────────────
 print(f"\n{'='*40}")
 print(f"結果: {passed}件成功 / {failed}件失敗")
 if failed == 0:

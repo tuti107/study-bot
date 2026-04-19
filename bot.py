@@ -803,28 +803,42 @@ def get_pending_exchanges() -> list[dict]:
 
 def approve_exchange_if_pending(exchange_id: int, user_id: str) -> dict | None:
     """pending状態の交換申請のみ approved に遷移し、同一トランザクションでクレジットを差引く。
-    - 既に処理済み or 存在しない id: None を返す（deductは走らない）
-    - 残高不足で CHECK 制約違反: sqlite3.IntegrityError を伝播"""
+    - 既に処理済み or 存在しない id: None を返す
+    - 残高不足: status='pending' のまま、reason='insufficient_balance' を含む dict を返す
+      (本番 DB には CHECK(balance>=0) が未適用のため、アプリ側で明示ガード)
+    - 承認成功: status='approved' + new_balance を含む dict を返す"""
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "UPDATE exchanges SET status='approved' WHERE id=? AND status='pending'",
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM exchanges WHERE id=? AND status='pending'",
+            (exchange_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        row = dict(row)
+        bal_row = conn.execute(
+            "SELECT balance FROM credits WHERE user_id=?", (user_id,),
+        ).fetchone()
+        current_balance = bal_row[0] if bal_row else 0
+        if current_balance < row["cost"]:
+            row["reason"] = "insufficient_balance"
+            row["balance"] = current_balance
+            return row
+        conn.execute(
+            "UPDATE exchanges SET status='approved' WHERE id=?",
             (exchange_id,),
         )
-        if cur.rowcount == 0:
-            return None
-        conn.row_factory = sqlite3.Row
-        row = dict(conn.execute(
-            "SELECT * FROM exchanges WHERE id=?", (exchange_id,),
-        ).fetchone())
         conn.execute(
             """UPDATE credits SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP
                WHERE user_id = ?""",
             (row["cost"], user_id),
         )
-        balance = conn.execute(
+        new_balance = conn.execute(
             "SELECT balance FROM credits WHERE user_id=?", (user_id,),
         ).fetchone()[0]
-    row["new_balance"] = balance
+    row["status"] = "approved"
+    row["new_balance"] = new_balance
     return row
 
 
@@ -1743,6 +1757,14 @@ def handle_parent(user_id: str, reply_token: str, msg: dict,
             exchange = approve_exchange_if_pending(exchange_id, child_db_uid)
             if exchange is None:
                 reply(reply_token, f"申請 #{exchange_id} は既に処理済みか存在しません。")
+                return
+            if exchange.get("reason") == "insufficient_balance":
+                reply(
+                    reply_token,
+                    f"申請 #{exchange_id}「{exchange['prize_name']}」は残高不足のため承認できません。\n"
+                    f"（必要: {exchange['cost']}cr / 現在残高: {exchange['balance']}cr）\n"
+                    f"申請は pending のまま残っています。",
+                )
                 return
             new_balance = exchange["new_balance"]
             reply(reply_token, f"申請 #{exchange_id}「{exchange['prize_name']}」を承認しました。\n（{exchange['cost']}cr 差し引き、残高: {new_balance}cr）")
