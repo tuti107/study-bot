@@ -388,6 +388,7 @@ topics.mastery = 移動平均で更新（新しい結果ほど重み大）
    - 理科: 新編新しい理科6（東京書籍）
    - 社会: 小学社会6（教育出版）
 6. **学習者プロファイル**: `student_profile.json` に登録済み（§1.1参照）
+7. **開発用 Supervisor ロール**: 導入する（詳細は §9）。環境変数 `SUPERVISOR_USER_ID` で有効化し、本番息子データと完全分離した仮想子ID (`sv-child:*`) で動作する。当面の間継続利用する
 
 ---
 
@@ -398,3 +399,129 @@ topics.mastery = 移動平均で更新（新しい結果ほど重み大）
 - [ ] 週次レポートで「今週の成長」「要補強の単元」「来週の方針」が具体的に述べられる
 - [ ] 出題はすべて学年の既習範囲に収まり、未習概念が問われない
 - [ ] 誤答の分類（計算ミス / 概念誤解 / 読み違い）が記録され、保護者が傾向を把握できる
+
+---
+
+## 9. Supervisor モード（開発・検証用ロール）
+
+### 9.1 背景と目的
+
+本番運用では「親」と「子」は別々のLINEアカウントで操作する前提だが、開発・デバッグ段階では次の課題がある：
+
+- 子のLINE端末を都度借りるのが困難
+- 親機能と子機能を開発者ひとりで通しで検証したい
+- 息子の本番データを壊さずにリグレッションテストしたい
+
+そこで **開発者本人（supervisor）が自分のLINEアカウントから親機能・子機能の両方を実行できる** デバッグ用ロールを追加する。本ロールは当面継続利用する（一時的なテスト機能ではない）。
+
+### 9.2 ロール定義
+
+| ロール | LINE ID | 用途 |
+|---|---|---|
+| `parent` | `PARENT_USER_ID` | 本番の保護者ユーザー |
+| `child` | `CHILD_USER_ID` | 本番の児童ユーザー（実際の息子） |
+| `supervisor` | `SUPERVISOR_USER_ID`（新規環境変数） | 開発者本人。`PARENT_USER_ID` と同一LINE IDでも可 |
+
+**データ分離の絶対原則**:
+
+- supervisor が「子」として行った学習は、**本番の息子のデータと混ざらない**
+- 息子の `learning_records`, `question_attempts`, `review_queue`, `topics.mastery`, `credits` は supervisor の操作で一切更新されない
+- 具体的には supervisor が子モードで動くとき、DB上の `user_id` を仮想ID `sv-child:<SUPERVISOR_USER_ID>` として扱う
+
+### 9.3 環境変数とプロファイル
+
+| 環境変数 | 説明 | 必須 |
+|---|---|---|
+| `SUPERVISOR_USER_ID` | supervisor のLINE ID。未設定なら機能ごと無効 | 任意 |
+
+| ファイル | 説明 |
+|---|---|
+| `supervisor_profile.json` | supervisor が子モードで使う仮想児童プロファイル。形式は `student_profile.json` と同じ。`.gitignore` 済み |
+| `supervisor_profile.example.json` | テンプレート（例: 名前「テスト太郎」学年6年）をリポジトリに追跡 |
+
+supervisor の子モード時のみ `supervisor_profile.json` が読まれ、本物の `student_profile.json` は一切参照されない。
+
+### 9.4 モード切替コマンド
+
+supervisor は1つのLINEアカウントで親モード・子モードを切り替えるため、コマンドベース＋永続モード方式を採用する。
+
+| コマンド | 動作 |
+|---|---|
+| `/sv parent` | 親モードに切替。以降のメッセージは `handle_parent` 相当で処理 |
+| `/sv child` | 子モードに切替。以降のメッセージは `handle_child` 相当で処理（user_id は `sv-child:*`） |
+| `/sv` | 現在のモードをトグル（parent ↔ child） |
+| `/sv status` | 現在のモードと、supervisor-child の累積学習数・クレジット残高を表示 |
+| `/sv reset` | supervisor-child の学習データ（`sv-child:*` ユーザーの全レコード）を削除。確認プロンプトあり |
+| `/sv report today` | supervisor-child の日次レポートをその場で生成して返す（スケジューラ非依存） |
+| `/sv help` | コマンド一覧を表示 |
+
+現在のモードは次の新規テーブルで永続化する：
+
+```
+supervisor_state
+  user_id TEXT PRIMARY KEY     -- supervisor のLINE ID
+  mode TEXT CHECK(mode IN ('parent','child'))
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+```
+
+初期モードは `parent`（誤って子モードに入ったまま親操作をする事故を避けるため）。
+
+### 9.5 メッセージディスパッチの変更
+
+webhook ハンドラの冒頭で supervisor 判定を行い、既存の親/子判定より先に分岐する：
+
+```
+if SUPERVISOR_USER_ID and event.source.user_id == SUPERVISOR_USER_ID:
+    handle_supervisor(event)   # 新規
+elif event.source.user_id == PARENT_USER_ID:
+    handle_parent(event)
+elif event.source.user_id == CHILD_USER_ID:
+    handle_child(event)
+```
+
+`handle_supervisor` の責務：
+
+1. テキストが `/sv` で始まる場合はコマンドとして処理
+2. それ以外は現在のモードに応じて：
+   - `parent` モード → `handle_parent` のロジックを呼び出す（user_id は `SUPERVISOR_USER_ID` のまま）
+   - `child` モード → `handle_child` のロジックを呼び出すが、**DB操作上の user_id を `sv-child:<SUPERVISOR_USER_ID>` に差し替え**、`student_profile.json` の代わりに `supervisor_profile.json` を参照
+
+### 9.6 データ分離の実装方針
+
+`handle_child` のDB操作箇所を「有効な user_id」を引数化することで対応する：
+
+- `learning_records.user_id`
+- `review_queue.user_id`
+- `credits.user_id`
+- LINE push 先（reply_token がない場合の push 宛先）は **LINE ID** であるため、supervisor 子モードの push 先は `SUPERVISOR_USER_ID`（仮想IDではない）
+
+`question_attempts` は `learning_record_id` 経由で間接的に分離されるので追加対応不要。
+
+`topics` は共有テーブルで構わない（単元マスターは本番・supervisor 共通に使える）。ただし `topics.mastery` は user 横断の値ではなく user ごとに集計する設計なので、もし現状 user 非依存で更新しているなら **user 別テーブルに分離** する必要がある。→ 実装時に確認ポイント。
+
+### 9.7 スケジュール処理（日次・週次レポート）の扱い
+
+- 本番スケジューラ（APScheduler）は `CHILD_USER_ID` 向けの処理のみを対象とする。`sv-child:*` は対象外
+- supervisor の日次・週次レポートは **自動送信しない**（`/sv report today` / `/sv report week` の明示コマンドでのみ生成）
+- 理由：supervisor が断続的にテストするとレポート品質が安定せず、運用時の「通常レポート」と混乱するため
+
+### 9.8 本番移行時の扱い
+
+- supervisor ロールは「当面継続利用」する前提
+- 環境変数 `SUPERVISOR_USER_ID` を未設定にすれば完全に無効化される（コマンドも no-op）
+- 仮想ID `sv-child:*` は接頭辞で本番データと判別可能：
+  - `DELETE FROM learning_records WHERE user_id LIKE 'sv-child:%'` 等で一括削除可能
+  - 本番レポートや集計クエリでは明示的に `WHERE user_id NOT LIKE 'sv-child:%'` で除外することを推奨
+
+### 9.9 スコープ外 / 非目標
+
+- 複数 supervisor の同時サポートはしない（1人のみ）
+- supervisor を一般ユーザーに公開しない（`/sv` コマンドは SUPERVISOR_USER_ID 以外のユーザーに対しては完全に no-op）
+- supervisor-child の学習データを本番の息子データにマージする機能は提供しない（それが必要になった時点で設計しなおす）
+- 本番親と supervisor を同時に別LINEアカウントで動かすことは想定しない（`PARENT_USER_ID == SUPERVISOR_USER_ID` が通常運用）
+
+### 9.10 セキュリティ観点
+
+- `/sv` コマンドは `event.source.user_id == SUPERVISOR_USER_ID` の厳密一致で守る（メッセージ本文に `SUPERVISOR_USER_ID` が含まれているだけでは発火させない）
+- `SUPERVISOR_USER_ID` 自体は機密扱い（ログ出力時にマスクする、P1-6 と合わせる）
+- `/sv reset` は破壊的操作のため確認ステップ必須

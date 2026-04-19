@@ -7,3 +7,4 @@ ngrok.exe
 logs/
 images/
 student_profile.json
+supervisor_profile.json

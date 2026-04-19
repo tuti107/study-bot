@@ -4,9 +4,11 @@ import hmac
 import json
 import os
 import sqlite3
+import threading
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, timedelta
 
 import anthropic
@@ -25,6 +27,8 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 PARENT_USER_ID = os.environ["PARENT_USER_ID"]
 CHILD_USER_ID = os.environ["CHILD_USER_ID"]
 REPORT_HOUR = int(os.environ.get("REPORT_HOUR", "21"))
+# Supervisor（開発・検証用ロール、SPEC §9）。未設定なら機能ごと無効。
+SUPERVISOR_USER_ID = os.environ.get("SUPERVISOR_USER_ID") or None
 
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
@@ -33,7 +37,16 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "study_bot.db")
 IMAGE_DIR = os.path.join(os.path.dirname(__file__), "images")
 PRIZES_PATH = os.path.join(os.path.dirname(__file__), "prizes.json")
 PROFILE_PATH = os.path.join(os.path.dirname(__file__), "student_profile.json")
+SUPERVISOR_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "supervisor_profile.json")
 CREDIT_PER_CORRECT = 10
+
+# supervisor の仮想子ユーザーID（sv-child:<LINE_ID>）。本番息子データと接頭辞で分離。
+def _sv_child_id(supervisor_line_id: str) -> str:
+    return f"sv-child:{supervisor_line_id}"
+
+# スレッドローカル: イベント単位のプロファイルパス切替用。
+# webhook の ThreadPoolExecutor が各イベントに固有のプロファイルを注入する。
+_req_local = threading.local()
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 os.makedirs(IMAGE_DIR, exist_ok=True)
@@ -124,7 +137,7 @@ def init_db() -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS credits (
                 user_id    TEXT PRIMARY KEY,
-                balance    INTEGER DEFAULT 0,
+                balance    INTEGER DEFAULT 0 CHECK(balance >= 0),
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -144,9 +157,28 @@ def init_db() -> None:
                 processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS supervisor_state (
+                user_id    TEXT PRIMARY KEY,
+                mode       TEXT NOT NULL DEFAULT 'parent' CHECK(mode IN ('parent','child')),
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
 
 # ── DB helpers ───────────────────────────────────────────────────────────────
+
+@contextmanager
+def _db_conn(conn: sqlite3.Connection | None = None):
+    """トランザクション統合用。外部から conn を渡されたらそれを使い、
+    なければ新しく開いて with ブロック終了時にコミットする。
+    外部から渡された場合はコミット/クローズは呼び出し元の責任。"""
+    if conn is not None:
+        yield conn
+        return
+    with sqlite3.connect(DB_PATH) as c:
+        yield c
+
 
 def get_active_session(user_id: str) -> dict | None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -262,13 +294,14 @@ REVIEW_INTERVALS = [1, 3, 7, 14, 30]  # 忘却曲線：正答で次の段階へ�
 MASTERY_ALPHA = 0.4                    # 指数移動平均の重み（新しい結果）
 
 def update_review_queue_from_result(user_id: str, topic_id: int,
-                                    questions: list, results: list) -> None:
+                                    questions: list, results: list,
+                                    conn: sqlite3.Connection | None = None) -> None:
     """1セッション分の採点結果から review_queue を更新する。
     - 誤答: interval=1 で pending エントリを作成または更新（既存は1にリセット）
     - 正答: 既存の pending エントリを次の間隔に昇格、30日超えなら retired
     - concept_key は questions[i].concept_keys の先頭を使用（無ければ NULL）"""
     today = date.today()
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db_conn(conn) as conn:
         for q, r in zip(questions, results):
             concept_keys = q.get("concept_keys") or r.get("concept_keys") or []
             concept_key = concept_keys[0] if concept_keys else None
@@ -332,13 +365,14 @@ def update_review_queue_from_result(user_id: str, topic_id: int,
 
 
 def update_topic_mastery(topic_id: int, score: int, total: int,
-                         alpha: float = MASTERY_ALPHA) -> float:
+                         alpha: float = MASTERY_ALPHA,
+                         conn: sqlite3.Connection | None = None) -> float:
     """指数移動平均で topics.mastery を更新し、新しい mastery を返す。
     mastery_new = α * (score/total) + (1-α) * mastery_old"""
     if total <= 0:
         return 0.0
     ratio = score / total
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db_conn(conn) as conn:
         row = conn.execute("SELECT mastery FROM topics WHERE id=?", (topic_id,)).fetchone()
         old = row[0] if row and row[0] is not None else 0.0
         new = alpha * ratio + (1 - alpha) * old
@@ -417,7 +451,8 @@ def format_due_reviews_for_prompt(due_reviews: list[dict]) -> str:
 
 def apply_grading_results(user_id: str, default_topic_id: int,
                           learning_record_id: int,
-                          questions: list, results: list) -> dict:
+                          questions: list, results: list,
+                          conn: sqlite3.Connection | None = None) -> dict:
     """採点結果を question_attempts / review_queue / topics.mastery に反映する。
     復習問題（origin='review' かつ review_topic_id あり）は復習対象トピックに紐づける。
     戻り値: トピック別の (score, total) 集計と更新後 mastery。"""
@@ -428,8 +463,8 @@ def apply_grading_results(user_id: str, default_topic_id: int,
         else:
             q_topics.append(default_topic_id)
 
-    # 1. question_attempts 保存（各問ごとのトピックで）
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db_conn(conn) as conn:
+        # 1. question_attempts 保存（各問ごとのトピックで）
         for q, r, tid in zip(questions, results, q_topics):
             conn.execute(
                 """INSERT INTO question_attempts
@@ -448,26 +483,60 @@ def apply_grading_results(user_id: str, default_topic_id: int,
                  q.get("origin", "today")),
             )
 
-    # 2. review_queue 更新（トピック別にグループ化）
-    by_topic: dict[int, tuple[list, list]] = {}
-    for q, r, tid in zip(questions, results, q_topics):
-        by_topic.setdefault(tid, ([], []))
-        by_topic[tid][0].append(q)
-        by_topic[tid][1].append(r)
-    for tid, (qs, rs) in by_topic.items():
-        update_review_queue_from_result(user_id, tid, qs, rs)
+        # 2. review_queue 更新（トピック別にグループ化）
+        by_topic: dict[int, tuple[list, list]] = {}
+        for q, r, tid in zip(questions, results, q_topics):
+            by_topic.setdefault(tid, ([], []))
+            by_topic[tid][0].append(q)
+            by_topic[tid][1].append(r)
+        for tid, (qs, rs) in by_topic.items():
+            update_review_queue_from_result(user_id, tid, qs, rs, conn=conn)
 
-    # 3. mastery 更新（トピック別の正答率で）
-    summary: dict[int, dict] = {}
-    for r, tid in zip(results, q_topics):
-        agg = summary.setdefault(tid, {"score": 0, "total": 0})
-        agg["total"] += 1
-        if r.get("correct"):
-            agg["score"] += 1
-    for tid, agg in summary.items():
-        agg["mastery"] = update_topic_mastery(tid, agg["score"], agg["total"])
+        # 3. mastery 更新（トピック別の正答率で）
+        summary: dict[int, dict] = {}
+        for r, tid in zip(results, q_topics):
+            agg = summary.setdefault(tid, {"score": 0, "total": 0})
+            agg["total"] += 1
+            if r.get("correct"):
+                agg["score"] += 1
+        for tid, agg in summary.items():
+            agg["mastery"] = update_topic_mastery(tid, agg["score"], agg["total"], conn=conn)
 
     return summary
+
+
+def finalize_grading(user_id: str, default_topic_id: int,
+                     learning_record_id: int,
+                     questions: list, results: list,
+                     credit_per_correct: int) -> dict:
+    """採点反映・learning_record完了・クレジット加算を1トランザクションで実行する。
+    戻り値: {'score', 'total', 'earned', 'balance', 'by_topic'}"""
+    score = sum(1 for r in results if r.get("correct"))
+    earned = score * credit_per_correct
+    total = len(results)
+    with sqlite3.connect(DB_PATH) as conn:
+        summary = apply_grading_results(
+            user_id, default_topic_id, learning_record_id,
+            questions, results, conn=conn,
+        )
+        conn.execute(
+            "UPDATE learning_records SET score=?, status='done' WHERE id=?",
+            (score, learning_record_id),
+        )
+        conn.execute(
+            """INSERT INTO credits (user_id, balance) VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+               balance = balance + excluded.balance,
+               updated_at = CURRENT_TIMESTAMP""",
+            (user_id, earned),
+        )
+        balance = conn.execute(
+            "SELECT balance FROM credits WHERE user_id=?", (user_id,),
+        ).fetchone()[0]
+    return {
+        "score": score, "total": total, "earned": earned,
+        "balance": balance, "by_topic": summary,
+    }
 
 
 def set_session_status(session_id: int, status: str) -> None:
@@ -487,15 +556,6 @@ def add_credits(user_id: str, amount: int) -> int:
                balance = balance + excluded.balance,
                updated_at = CURRENT_TIMESTAMP""",
             (user_id, amount),
-        )
-        return conn.execute("SELECT balance FROM credits WHERE user_id=?", (user_id,)).fetchone()[0]
-
-def deduct_credits(user_id: str, amount: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """UPDATE credits SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP
-               WHERE user_id = ?""",
-            (amount, user_id),
         )
         return conn.execute("SELECT balance FROM credits WHERE user_id=?", (user_id,)).fetchone()[0]
 
@@ -712,12 +772,136 @@ def get_pending_exchanges() -> list[dict]:
         ).fetchall()
     return [dict(r) for r in rows]
 
-def update_exchange_status(exchange_id: int, status: str) -> dict | None:
+def approve_exchange_if_pending(exchange_id: int, user_id: str) -> dict | None:
+    """pending状態の交換申請のみ approved に遷移し、同一トランザクションでクレジットを差引く。
+    - 既に処理済み or 存在しない id: None を返す（deductは走らない）
+    - 残高不足で CHECK 制約違反: sqlite3.IntegrityError を伝播"""
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("UPDATE exchanges SET status=? WHERE id=?", (status, exchange_id))
+        cur = conn.execute(
+            "UPDATE exchanges SET status='approved' WHERE id=? AND status='pending'",
+            (exchange_id,),
+        )
+        if cur.rowcount == 0:
+            return None
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM exchanges WHERE id=?", (exchange_id,)).fetchone()
+        row = dict(conn.execute(
+            "SELECT * FROM exchanges WHERE id=?", (exchange_id,),
+        ).fetchone())
+        conn.execute(
+            """UPDATE credits SET balance = balance - ?, updated_at = CURRENT_TIMESTAMP
+               WHERE user_id = ?""",
+            (row["cost"], user_id),
+        )
+        balance = conn.execute(
+            "SELECT balance FROM credits WHERE user_id=?", (user_id,),
+        ).fetchone()[0]
+    row["new_balance"] = balance
+    return row
+
+
+def reject_exchange_if_pending(exchange_id: int) -> dict | None:
+    """pending状態のみ rejected に遷移。既に処理済み/存在しない場合は None。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE exchanges SET status='rejected' WHERE id=? AND status='pending'",
+            (exchange_id,),
+        )
+        if cur.rowcount == 0:
+            return None
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM exchanges WHERE id=?", (exchange_id,),
+        ).fetchone()
     return dict(row) if row else None
+
+
+# ── Supervisor (開発・検証用ロール、SPEC §9) ─────────────────────────────────
+
+def get_supervisor_mode(user_id: str) -> str:
+    """現在の supervisor モード（'parent' または 'child'）。未設定なら 'parent'。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT mode FROM supervisor_state WHERE user_id=?", (user_id,)
+        ).fetchone()
+    return row[0] if row else "parent"
+
+
+def set_supervisor_mode(user_id: str, mode: str) -> None:
+    if mode not in ("parent", "child"):
+        raise ValueError(f"invalid supervisor mode: {mode}")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """INSERT INTO supervisor_state (user_id, mode) VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 mode = excluded.mode,
+                 updated_at = CURRENT_TIMESTAMP""",
+            (user_id, mode),
+        )
+
+
+def reset_supervisor_child_data(db_user_id: str) -> dict:
+    """supervisor-child の全学習データを削除。本番息子データ(user_id != db_user_id)は
+    触らない。削除件数を返す。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "DELETE FROM question_attempts WHERE learning_record_id IN "
+            "(SELECT id FROM learning_records WHERE user_id=?)",
+            (db_user_id,),
+        )
+        qa = cur.rowcount
+        conn.execute(
+            "DELETE FROM session_images WHERE session_id IN "
+            "(SELECT id FROM sessions WHERE user_id=?)",
+            (db_user_id,),
+        )
+        lr = conn.execute(
+            "DELETE FROM learning_records WHERE user_id=?", (db_user_id,)
+        ).rowcount
+        rq = conn.execute(
+            "DELETE FROM review_queue WHERE user_id=?", (db_user_id,)
+        ).rowcount
+        s = conn.execute(
+            "DELETE FROM sessions WHERE user_id=?", (db_user_id,)
+        ).rowcount
+        c = conn.execute(
+            "DELETE FROM credits WHERE user_id=?", (db_user_id,)
+        ).rowcount
+        e = conn.execute(
+            "DELETE FROM exchanges WHERE user_id=?", (db_user_id,)
+        ).rowcount
+    return {
+        "question_attempts": qa,
+        "learning_records": lr,
+        "review_queue": rq,
+        "sessions": s,
+        "credits": c,
+        "exchanges": e,
+    }
+
+
+def supervisor_stats(db_user_id: str) -> dict:
+    """supervisor-child の現状統計（/sv status 用）。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        lr = conn.execute(
+            "SELECT COUNT(*) FROM learning_records WHERE user_id=?", (db_user_id,)
+        ).fetchone()[0]
+        rq = conn.execute(
+            "SELECT COUNT(*) FROM review_queue WHERE user_id=? AND status='pending'",
+            (db_user_id,),
+        ).fetchone()[0]
+        bal_row = conn.execute(
+            "SELECT balance FROM credits WHERE user_id=?", (db_user_id,)
+        ).fetchone()
+        pex = conn.execute(
+            "SELECT COUNT(*) FROM exchanges WHERE user_id=? AND status='pending'",
+            (db_user_id,),
+        ).fetchone()[0]
+    return {
+        "learning_records": lr,
+        "pending_reviews": rq,
+        "balance": bal_row[0] if bal_row else 0,
+        "pending_exchanges": pex,
+    }
 
 
 # ── LINE API ─────────────────────────────────────────────────────────────────
@@ -798,7 +982,19 @@ def load_image_b64(path: str) -> str:
 # ── 学習者プロファイル ────────────────────────────────────────────────────────
 
 def load_student_profile() -> dict:
-    with open(PROFILE_PATH, encoding="utf-8") as f:
+    """学習者プロファイルを読み込む。
+    _req_local.profile_path が設定されていればそれを優先（supervisor 用）。
+    supervisor プロファイルが無ければ明確なエラーを投げる（サイレントに本番プロファイルへ
+    フォールバックするとデータ分離の前提が崩れるため）。"""
+    path = getattr(_req_local, "profile_path", None) or PROFILE_PATH
+    if not os.path.exists(path):
+        if path == SUPERVISOR_PROFILE_PATH:
+            raise FileNotFoundError(
+                f"supervisor_profile.json が見つかりません: {path}\n"
+                f"supervisor_profile.example.json をコピーして作成してください。"
+            )
+        raise FileNotFoundError(f"プロファイルが見つかりません: {path}")
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 def build_profile_context() -> str:
@@ -1239,19 +1435,29 @@ def send_weekly_report() -> None:
 
 # ── メッセージハンドラ ────────────────────────────────────────────────────────
 
-def handle_child(user_id: str, reply_token: str, msg: dict) -> None:
-    session = get_active_session(user_id)
+def handle_child(user_id: str, reply_token: str, msg: dict,
+                 db_user_id: str | None = None,
+                 parent_line_id: str | None = None) -> None:
+    """子ユーザー（または supervisor 子モード）のメッセージを処理する。
+    - user_id:        LINE 送信元 ID（reply/push 宛先）
+    - db_user_id:     DB上で学習データを紐づける user_id。未指定なら user_id と同じ。
+                      supervisor 子モード時のみ 'sv-child:<SUPERVISOR_USER_ID>' が渡される
+    - parent_line_id: 親への push 宛先。未指定なら PARENT_USER_ID
+    """
+    db_uid = db_user_id or user_id
+    parent_pid = parent_line_id or PARENT_USER_ID
+    session = get_active_session(db_uid)
 
     if msg.get("type") == "text":
         text = msg["text"].strip()
 
         if text == "残高":
-            balance = get_credits(user_id)
+            balance = get_credits(db_uid)
             reply(reply_token, f"現在のクレジット残高: {balance}cr")
 
         elif text == "交換":
             prizes = load_prizes()
-            balance = get_credits(user_id)
+            balance = get_credits(db_uid)
             reply(reply_token, format_prize_catalog(prizes, balance))
 
         elif text.startswith("交換 "):
@@ -1262,13 +1468,13 @@ def handle_child(user_id: str, reply_token: str, msg: dict) -> None:
                 if prize is None:
                     reply(reply_token, "その番号の景品はありません。")
                     return
-                balance = get_credits(user_id)
+                balance = get_credits(db_uid)
                 if balance < prize["cost"]:
                     reply(reply_token, f"クレジットが足りません。必要: {prize['cost']}cr / 残高: {balance}cr")
                     return
-                exchange_id = create_exchange(user_id, prize["name"], prize["cost"])
+                exchange_id = create_exchange(db_uid, prize["name"], prize["cost"])
                 reply(reply_token, f"「{prize['name']}」の交換申請を送りました！\n保護者の承認をお待ちください。")
-                push(PARENT_USER_ID,
+                push(parent_pid,
                      f"【景品交換申請 #{exchange_id}】\n"
                      f"景品: {prize['name']} ({prize['cost']}cr)\n"
                      f"「承認 {exchange_id}」または「却下 {exchange_id}」で返答してください。")
@@ -1284,8 +1490,8 @@ def handle_child(user_id: str, reply_token: str, msg: dict) -> None:
                 reply(reply_token, "写真が届いていません。ノートや教科書の写真を送ってください📷")
                 return
             reply(reply_token, f"{len(image_paths)}枚の写真を受け取りました。学習内容を分析してテストを作成中です...📝")
-            history = get_recent_topics_summary(user_id)
-            due = get_due_reviews(user_id)
+            history = get_recent_topics_summary(db_uid)
+            due = get_due_reviews(db_uid)
             step_a = analyze_step_a(
                 image_paths,
                 recent_topics_summary=history,
@@ -1296,7 +1502,7 @@ def handle_child(user_id: str, reply_token: str, msg: dict) -> None:
                 due_reviews_detail=format_due_reviews_for_prompt(due),
             )
             subjects_data = merge_step_a_b(step_a, step_b)
-            save_learning_records(session["id"], user_id, subjects_data)
+            save_learning_records(session["id"], db_uid, subjects_data)
             set_session_status(session["id"], "grading")
             for i, s in enumerate(subjects_data, 1):
                 today_qs = [q for q in s["questions"] if q.get("origin") != "review"]
@@ -1327,7 +1533,7 @@ def handle_child(user_id: str, reply_token: str, msg: dict) -> None:
 
     if session is None or session["status"] == "collecting":
         if session is None:
-            session = {"id": create_session(user_id), "status": "collecting"}
+            session = {"id": create_session(db_uid), "status": "collecting"}
         image_path = download_image(msg["id"])
         add_session_image(session["id"], image_path)
         reply(reply_token, "写真を受け取りました📷\n他の科目の写真も続けて送れます。全部送ったら「おわり」と入力してください。")
@@ -1342,12 +1548,13 @@ def handle_child(user_id: str, reply_token: str, msg: dict) -> None:
         reply(reply_token, f"【{subject_name}】の解答を受信しました。採点中です...✏️")
         image_path = download_image(msg["id"])
         results = grade_answers(image_path, subject["questions"])
-        score = sum(1 for r in results if r.get("correct"))
-        earned = score * CREDIT_PER_CORRECT
-        balance = add_credits(user_id, earned)
-        apply_grading_results(user_id, subject["topic_id"], subject["id"],
-                              subject["questions"], results)
-        complete_learning_record(subject["id"], score)
+        outcome = finalize_grading(
+            db_uid, subject["topic_id"], subject["id"],
+            subject["questions"], results, CREDIT_PER_CORRECT,
+        )
+        score = outcome["score"]
+        earned = outcome["earned"]
+        balance = outcome["balance"]
 
         lines = [f"【{subject_name} 採点結果】 {score}/{subject['total']}問正解 🎉\n"]
         for i, r in enumerate(results, 1):
@@ -1368,7 +1575,18 @@ def handle_child(user_id: str, reply_token: str, msg: dict) -> None:
             push(user_id, "全科目の採点完了！今日もよく頑張りました🌟")
 
 
-def handle_parent(user_id: str, reply_token: str, msg: dict) -> None:
+def handle_parent(user_id: str, reply_token: str, msg: dict,
+                  child_db_user_id: str | None = None,
+                  child_line_id: str | None = None) -> None:
+    """親ユーザー（または supervisor 親モード）のメッセージを処理する。
+    - user_id:          LINE 送信元 ID（親本人、reply/push 宛先）
+    - child_db_user_id: 参照する「子」データの DB user_id。未指定なら CHILD_USER_ID。
+                        supervisor 親モード時のみ 'sv-child:<SUPERVISOR_USER_ID>' が渡される
+    - child_line_id:    承認/却下通知の push 宛先。未指定なら CHILD_USER_ID
+    """
+    child_db_uid = child_db_user_id or CHILD_USER_ID
+    child_lid = child_line_id or CHILD_USER_ID
+
     if msg.get("type") != "text":
         reply(reply_token, "保護者用コマンド: 「レポート」「週次」「承認 ID」「却下 ID」「申請一覧」")
         return
@@ -1377,19 +1595,19 @@ def handle_parent(user_id: str, reply_token: str, msg: dict) -> None:
 
     if text == "レポート":
         today = date.today().isoformat()
-        records = get_daily_summary(CHILD_USER_ID, today)
-        balance = get_credits(CHILD_USER_ID)
-        report = generate_daily_report(records, balance, user_id=CHILD_USER_ID)
+        records = get_daily_summary(child_db_uid, today)
+        balance = get_credits(child_db_uid)
+        report = generate_daily_report(records, balance, user_id=child_db_uid)
         reply(reply_token, f"📊 【日次レポート】{today}\n\n{report}")
 
     elif text == "週次":
-        records = get_weekly_summary(CHILD_USER_ID)
-        balance = get_credits(CHILD_USER_ID)
-        report = generate_weekly_report(records, balance, user_id=CHILD_USER_ID)
+        records = get_weekly_summary(child_db_uid)
+        balance = get_credits(child_db_uid)
+        report = generate_weekly_report(records, balance, user_id=child_db_uid)
         reply(reply_token, f"📅 【週次レポート】\n\n{report}")
 
     elif text == "申請一覧":
-        exchanges = get_pending_exchanges()
+        exchanges = [e for e in get_pending_exchanges() if e["user_id"] == child_db_uid]
         if not exchanges:
             reply(reply_token, "現在、未処理の景品交換申請はありません。")
         else:
@@ -1403,23 +1621,129 @@ def handle_parent(user_id: str, reply_token: str, msg: dict) -> None:
         action, *rest = text.split()
         try:
             exchange_id = int(rest[0])
-            status = "approved" if action == "承認" else "rejected"
-            exchange = update_exchange_status(exchange_id, status)
-            if exchange is None:
-                reply(reply_token, f"申請 #{exchange_id} が見つかりません。")
-                return
-            if status == "approved":
-                new_balance = deduct_credits(CHILD_USER_ID, exchange["cost"])
-                reply(reply_token, f"申請 #{exchange_id}「{exchange['prize_name']}」を承認しました。\n（{exchange['cost']}cr 差し引き、残高: {new_balance}cr）")
-                push(CHILD_USER_ID, f"景品「{exchange['prize_name']}」の交換が承認されました！\n残高: {new_balance}cr")
-            else:
-                reply(reply_token, f"申請 #{exchange_id}「{exchange['prize_name']}」を却下しました。")
-                push(CHILD_USER_ID, f"景品「{exchange['prize_name']}」の交換申請が却下されました。保護者に確認してみてください。")
         except (IndexError, ValueError):
             reply(reply_token, "「承認 番号」の形式で入力してください。例: 承認 1")
+            return
+        if action == "承認":
+            exchange = approve_exchange_if_pending(exchange_id, child_db_uid)
+            if exchange is None:
+                reply(reply_token, f"申請 #{exchange_id} は既に処理済みか存在しません。")
+                return
+            new_balance = exchange["new_balance"]
+            reply(reply_token, f"申請 #{exchange_id}「{exchange['prize_name']}」を承認しました。\n（{exchange['cost']}cr 差し引き、残高: {new_balance}cr）")
+            push(child_lid, f"景品「{exchange['prize_name']}」の交換が承認されました！\n残高: {new_balance}cr")
+        else:
+            exchange = reject_exchange_if_pending(exchange_id)
+            if exchange is None:
+                reply(reply_token, f"申請 #{exchange_id} は既に処理済みか存在しません。")
+                return
+            reply(reply_token, f"申請 #{exchange_id}「{exchange['prize_name']}」を却下しました。")
+            push(child_lid, f"景品「{exchange['prize_name']}」の交換申請が却下されました。保護者に確認してみてください。")
 
     else:
         reply(reply_token, "保護者用コマンド:\n・「レポート」: 本日の学習レポート\n・「週次」: 今週のレポート\n・「申請一覧」: 未処理の景品交換申請\n・「承認 ID」/「却下 ID」: 交換申請の処理")
+
+
+# ── Supervisor ディスパッチ（SPEC §9） ─────────────────────────────────────
+
+SV_HELP_TEXT = (
+    "【Supervisor コマンド】\n"
+    "/sv               モードをトグル（parent ↔ child）\n"
+    "/sv parent        親モードに切替\n"
+    "/sv child         子モードに切替\n"
+    "/sv status        現在のモードと統計を表示\n"
+    "/sv report today  supervisor-child の日次レポートを生成\n"
+    "/sv report week   supervisor-child の週次レポートを生成\n"
+    "/sv reset         supervisor-child の全データを削除（要 confirm）\n"
+    "/sv reset confirm 削除を実行\n"
+    "/sv help          このヘルプを表示"
+)
+
+
+def _handle_sv_command(sender_line_id: str, reply_token: str, text: str) -> None:
+    """/sv で始まるコマンドを処理する。"""
+    parts = text.split()
+    # parts[0] == "/sv"
+    cmd = parts[1] if len(parts) > 1 else ""
+    arg = parts[2] if len(parts) > 2 else ""
+    sv_db = _sv_child_id(sender_line_id)
+
+    if cmd == "" or cmd == "toggle":
+        current = get_supervisor_mode(sender_line_id)
+        new_mode = "child" if current == "parent" else "parent"
+        set_supervisor_mode(sender_line_id, new_mode)
+        reply(reply_token, f"[SV] モードを {current} → {new_mode} に切替えました。")
+
+    elif cmd in ("parent", "child"):
+        set_supervisor_mode(sender_line_id, cmd)
+        reply(reply_token, f"[SV] モードを {cmd} に切替えました。")
+
+    elif cmd == "status":
+        mode = get_supervisor_mode(sender_line_id)
+        s = supervisor_stats(sv_db)
+        reply(
+            reply_token,
+            f"[SV Status]\n"
+            f"mode: {mode}\n"
+            f"sv-child 学習記録: {s['learning_records']} 件\n"
+            f"復習キュー(pending): {s['pending_reviews']} 件\n"
+            f"クレジット残高: {s['balance']}cr\n"
+            f"未処理の交換申請: {s['pending_exchanges']} 件",
+        )
+
+    elif cmd == "report" and arg in ("today", "week"):
+        if arg == "today":
+            today = date.today().isoformat()
+            records = get_daily_summary(sv_db, today)
+            bal = get_credits(sv_db)
+            report = generate_daily_report(records, bal, user_id=sv_db)
+            reply(reply_token, f"[SV] 📊 日次レポート {today}\n\n{report}")
+        else:
+            records = get_weekly_summary(sv_db)
+            bal = get_credits(sv_db)
+            report = generate_weekly_report(records, bal, user_id=sv_db)
+            reply(reply_token, f"[SV] 📅 週次レポート\n\n{report}")
+
+    elif cmd == "reset":
+        if arg == "confirm":
+            result = reset_supervisor_child_data(sv_db)
+            summary = "\n".join(f"  {k}: {v}" for k, v in result.items())
+            reply(reply_token, f"[SV] supervisor-child データを削除しました。\n{summary}")
+        else:
+            reply(
+                reply_token,
+                "[SV] 破壊的操作です。本当に削除する場合は\n"
+                "  /sv reset confirm\n"
+                "と送ってください。",
+            )
+
+    elif cmd == "help":
+        reply(reply_token, SV_HELP_TEXT)
+
+    else:
+        reply(reply_token, f"[SV] 不明なコマンド: {text}\n\n{SV_HELP_TEXT}")
+
+
+def handle_supervisor(sender_line_id: str, reply_token: str, msg: dict) -> None:
+    """supervisor（開発・検証用ロール）の処理。
+    - /sv で始まるテキスト → コマンドとして処理
+    - それ以外 → 現在のモードに応じて handle_parent / handle_child に委譲。
+      子データは常に sv-child:<SUPERVISOR_USER_ID> にスコープされ、本番息子データと
+      混ざらない。push 先はすべて SUPERVISOR_USER_ID（同一 LINE 端末）。"""
+    text = msg.get("text", "").strip() if msg.get("type") == "text" else ""
+
+    if text.startswith("/sv"):
+        _handle_sv_command(sender_line_id, reply_token, text)
+        return
+
+    mode = get_supervisor_mode(sender_line_id)
+    sv_db = _sv_child_id(sender_line_id)
+    if mode == "child":
+        handle_child(sender_line_id, reply_token, msg,
+                     db_user_id=sv_db, parent_line_id=sender_line_id)
+    else:
+        handle_parent(sender_line_id, reply_token, msg,
+                      child_db_user_id=sv_db, child_line_id=sender_line_id)
 
 
 # ── Webhook ──────────────────────────────────────────────────────────────────
@@ -1440,14 +1764,23 @@ def record_webhook_event(event_id: str) -> bool:
 
 
 def _process_event(event: dict) -> None:
-    """1イベントをディスパッチ。例外はログするがプロセスを落とさない。"""
+    """1イベントをディスパッチ。例外はログするがプロセスを落とさない。
+    supervisor 判定は親・子判定より優先される（SPEC §9.5）。
+    イベント中のプロファイルパスはスレッドローカルに設定し、供給先 Claude 呼び出しが
+    supervisor 用プロファイルを読めるようにする。finally で必ずクリアする。"""
     if event.get("type") != "message":
         return
     user_id = event["source"]["userId"]
     reply_token = event["replyToken"]
     msg = event["message"]
+
+    is_supervisor = bool(SUPERVISOR_USER_ID and user_id == SUPERVISOR_USER_ID)
+    _req_local.profile_path = SUPERVISOR_PROFILE_PATH if is_supervisor else PROFILE_PATH
+
     try:
-        if user_id == PARENT_USER_ID:
+        if is_supervisor:
+            handle_supervisor(user_id, reply_token, msg)
+        elif user_id == PARENT_USER_ID:
             handle_parent(user_id, reply_token, msg)
         elif user_id == CHILD_USER_ID:
             handle_child(user_id, reply_token, msg)
@@ -1459,6 +1792,8 @@ def _process_event(event: dict) -> None:
             push(user_id, "エラーが発生しました。もう一度試してください。")
         except Exception:
             traceback.print_exc()
+    finally:
+        _req_local.profile_path = None
 
 
 @app.route("/webhook", methods=["POST"])
