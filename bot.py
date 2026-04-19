@@ -722,31 +722,72 @@ def update_exchange_status(exchange_id: int, status: str) -> dict | None:
 
 # ── LINE API ─────────────────────────────────────────────────────────────────
 
+LINE_TIMEOUT = (5, 30)          # (connect, read) 秒
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # LINE画像の受入上限: 10MB
+
+
 def verify_signature(body: bytes, signature: str) -> bool:
     mac = hmac.new(CHANNEL_SECRET.encode(), body, hashlib.sha256).digest()
     return hmac.compare_digest(base64.b64encode(mac).decode(), signature)
 
+
+def _line_request(method: str, url: str, **kwargs) -> requests.Response:
+    """LINE API 呼び出し共通ラッパ。timeout / Authorization / HTTPエラー検知を強制。"""
+    kwargs.setdefault("timeout", LINE_TIMEOUT)
+    headers = kwargs.pop("headers", {}) or {}
+    headers.setdefault("Authorization", f"Bearer {CHANNEL_ACCESS_TOKEN}")
+    resp = requests.request(method, url, headers=headers, **kwargs)
+    if resp.status_code >= 400:
+        print(f"[LINE] {method} {url} -> {resp.status_code} {resp.text[:300]}", flush=True)
+        resp.raise_for_status()
+    return resp
+
+
 def reply(reply_token: str, text: str) -> None:
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}
-    requests.post(LINE_REPLY_URL, headers=headers, json={
-        "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text}],
-    })
+    _line_request(
+        "POST", LINE_REPLY_URL,
+        headers={"Content-Type": "application/json"},
+        json={"replyToken": reply_token,
+              "messages": [{"type": "text", "text": text}]},
+    )
+
 
 def push(user_id: str, text: str) -> None:
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}
-    requests.post(LINE_PUSH_URL, headers=headers, json={
-        "to": user_id,
-        "messages": [{"type": "text", "text": text}],
-    })
+    _line_request(
+        "POST", LINE_PUSH_URL,
+        headers={"Content-Type": "application/json"},
+        json={"to": user_id,
+              "messages": [{"type": "text", "text": text}]},
+    )
+
 
 def download_image(message_id: str) -> str:
+    """LINEから画像を取得してローカル保存。Content-Type / サイズ上限を検証。"""
     url = LINE_CONTENT_URL.format(message_id)
-    headers = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}
-    resp = requests.get(url, headers=headers)
+    resp = _line_request("GET", url, stream=True)
+    content_type = (resp.headers.get("Content-Type") or "").lower()
+    if not content_type.startswith("image/"):
+        resp.close()
+        raise ValueError(f"unexpected content-type: {content_type!r}")
+    declared_len = int(resp.headers.get("Content-Length") or 0)
+    if declared_len > MAX_IMAGE_BYTES:
+        resp.close()
+        raise ValueError(f"image too large: {declared_len} bytes")
     path = os.path.join(IMAGE_DIR, f"{uuid.uuid4()}.jpg")
-    with open(path, "wb") as f:
-        f.write(resp.content)
+    written = 0
+    try:
+        with open(path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > MAX_IMAGE_BYTES:
+                    raise ValueError(f"image exceeded max size while streaming: {written}")
+                f.write(chunk)
+    except Exception:
+        if os.path.exists(path):
+            os.remove(path)
+        raise
     return path
 
 def load_image_b64(path: str) -> str:

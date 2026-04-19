@@ -46,6 +46,7 @@ def update_line_webhook(url: str) -> None:
             "Content-Type": "application/json",
         },
         json={"endpoint": webhook_url},
+        timeout=(5, 30),
     )
     if resp.status_code != 200:
         raise RuntimeError(f"Webhook更新失敗: {resp.status_code} {resp.text}")
@@ -53,7 +54,7 @@ def update_line_webhook(url: str) -> None:
 
 
 def notify_parent(url: str) -> None:
-    requests.post(
+    resp = requests.post(
         "https://api.line.me/v2/bot/message/push",
         headers={
             "Content-Type": "application/json",
@@ -63,7 +64,10 @@ def notify_parent(url: str) -> None:
             "to": PARENT_USER_ID,
             "messages": [{"type": "text", "text": f"勉強Botが起動しました。\nURL: {url}"}],
         },
+        timeout=(5, 30),
     )
+    if resp.status_code != 200:
+        print(f"親通知失敗: {resp.status_code} {resp.text}", file=sys.stderr)
 
 
 if __name__ == "__main__":
