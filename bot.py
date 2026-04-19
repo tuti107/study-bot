@@ -5,11 +5,12 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import anthropic
 import requests
@@ -35,10 +36,12 @@ LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 LINE_CONTENT_URL = "https://api-data.line.me/v2/bot/message/{}/content"
 DB_PATH = os.path.join(os.path.dirname(__file__), "study_bot.db")
 IMAGE_DIR = os.path.join(os.path.dirname(__file__), "images")
+LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
 PRIZES_PATH = os.path.join(os.path.dirname(__file__), "prizes.json")
 PROFILE_PATH = os.path.join(os.path.dirname(__file__), "student_profile.json")
 SUPERVISOR_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "supervisor_profile.json")
 CREDIT_PER_CORRECT = 10
+IMAGE_RETENTION_DAYS = int(os.environ.get("IMAGE_RETENTION_DAYS", "30"))
 
 # supervisor の仮想子ユーザーID（sv-child:<LINE_ID>）。本番息子データと接頭辞で分離。
 def _sv_child_id(supervisor_line_id: str) -> str:
@@ -50,6 +53,7 @@ _req_local = threading.local()
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 os.makedirs(IMAGE_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 
 # ── DB ──────────────────────────────────────────────────────────────────────
@@ -1004,6 +1008,81 @@ def load_image_b64(path: str) -> str:
         return base64.standard_b64encode(f.read()).decode()
 
 
+# ── 画像クリーンアップ (P1-5) ────────────────────────────────────────────────
+
+def cleanup_old_images(retention_days: int = IMAGE_RETENTION_DAYS,
+                       dry_run: bool = False) -> dict:
+    """保持期間を超えた images/ ファイルと、対応する session_images 行を削除する。
+
+    削除候補は必ず logs/cleanup_<timestamp>.log にダンプしてから削除する
+    （dry_run=True の場合はログのみ書いて実削除しない）。
+    戻り値に件数・ログパスを含める。"""
+    cutoff_ts = time.time() - retention_days * 86400
+    ts_label = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(LOGS_DIR, f"cleanup_{ts_label}.log")
+
+    # 1) ファイル系: mtime が cutoff より古いファイルを列挙
+    old_files: list[str] = []
+    if os.path.isdir(IMAGE_DIR):
+        for name in os.listdir(IMAGE_DIR):
+            fpath = os.path.join(IMAGE_DIR, name)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                if os.path.getmtime(fpath) < cutoff_ts:
+                    old_files.append(fpath)
+            except OSError:
+                continue
+
+    # 2) DB 行: ファイル削除対象 or 既にファイルが存在しない session_images 行を列挙
+    old_file_set = set(old_files)
+    orphan_rows: list[tuple[int, str]] = []  # (id, image_path)
+    with sqlite3.connect(DB_PATH) as conn:
+        for rid, ipath in conn.execute("SELECT id, image_path FROM session_images").fetchall():
+            if ipath in old_file_set or not os.path.exists(ipath):
+                orphan_rows.append((rid, ipath))
+
+    # 3) ログ書き出し (dry_run でも本番でも必ず書く)
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"# cleanup_old_images dry_run={dry_run} retention_days={retention_days}\n")
+        f.write(f"# cutoff_ts={cutoff_ts} ({datetime.fromtimestamp(cutoff_ts).isoformat()})\n")
+        f.write(f"# files_found={len(old_files)} db_rows_found={len(orphan_rows)}\n\n")
+        f.write("## FILES\n")
+        for p in old_files:
+            f.write(f"{p}\n")
+        f.write("\n## DB ROWS\n")
+        for rid, ipath in orphan_rows:
+            f.write(f"{rid}\t{ipath}\n")
+
+    files_deleted = 0
+    db_rows_deleted = 0
+    if not dry_run:
+        for p in old_files:
+            try:
+                os.remove(p)
+                files_deleted += 1
+            except OSError:
+                pass
+        if orphan_rows:
+            ids = [rid for rid, _ in orphan_rows]
+            placeholders = ",".join("?" for _ in ids)
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.execute(
+                    f"DELETE FROM session_images WHERE id IN ({placeholders})",
+                    ids,
+                )
+                db_rows_deleted = cur.rowcount or 0
+
+    return {
+        "dry_run": dry_run,
+        "files_found": len(old_files),
+        "files_deleted": files_deleted,
+        "db_rows_found": len(orphan_rows),
+        "db_rows_deleted": db_rows_deleted,
+        "log_path": log_path,
+    }
+
+
 # ── 学習者プロファイル ────────────────────────────────────────────────────────
 
 def load_student_profile() -> dict:
@@ -1846,11 +1925,19 @@ def start_scheduler() -> None:
     scheduler.add_job(send_daily_report, "cron", hour=REPORT_HOUR, minute=0)
     # 毎週日曜 REPORT_HOUR+1 時に週次レポート
     scheduler.add_job(send_weekly_report, "cron", day_of_week="sun", hour=REPORT_HOUR + 1, minute=0)
+    # 毎日 3:00 に古い画像を削除 (P1-5)
+    scheduler.add_job(cleanup_old_images, "cron", hour=3, minute=0)
     scheduler.start()
 
 
 if __name__ == "__main__":
     from waitress import serve
     init_db()
+    # 起動時に一度だけ古い画像を整理
+    try:
+        result = cleanup_old_images()
+        print(f"[startup] cleanup_old_images: {result}")
+    except Exception as e:
+        print(f"[startup] cleanup_old_images failed: {e}")
     start_scheduler()
     serve(app, host="127.0.0.1", port=5000)
