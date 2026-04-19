@@ -1176,13 +1176,24 @@ def _collect_text(message) -> str:
 
 
 def _parse_json_or_debug(raw_text: str, label: str) -> dict | list:
-    """JSONパース失敗時に生テキストをログ出力して再raise。"""
+    """JSONパース失敗時にログ出力して再raise。
+    既定では児童PIIを含みうる生テキストは残さず、sha256 先頭12桁と長さのみ記録する。
+    DEBUG 環境変数が設定されているときだけ生テキストをダンプする (P1-6)。"""
     extracted = extract_json(raw_text)
     try:
         return json.loads(extracted)
     except json.JSONDecodeError:
-        print(f"\n[{label}] JSONパース失敗。抽出後テキスト（先頭500文字）:\n{extracted[:500]}\n", flush=True)
-        print(f"[{label}] 生テキスト（先頭1000文字）:\n{raw_text[:1000]}\n", flush=True)
+        raw_hash = hashlib.sha256(raw_text.encode("utf-8", errors="replace")).hexdigest()[:12]
+        ext_hash = hashlib.sha256(extracted.encode("utf-8", errors="replace")).hexdigest()[:12]
+        print(
+            f"\n[{label}] JSONパース失敗 "
+            f"raw_len={len(raw_text)} raw_sha12={raw_hash} "
+            f"extracted_len={len(extracted)} extracted_sha12={ext_hash}",
+            flush=True,
+        )
+        if os.environ.get("DEBUG"):
+            print(f"[{label}] DEBUG 抽出後テキスト(先頭500):\n{extracted[:500]}\n", flush=True)
+            print(f"[{label}] DEBUG 生テキスト(先頭1000):\n{raw_text[:1000]}\n", flush=True)
         raise
 
 
