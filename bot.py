@@ -6,6 +6,7 @@ import os
 import sqlite3
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 
 import anthropic
@@ -135,6 +136,12 @@ def init_db() -> None:
                 cost       INTEGER NOT NULL,
                 status     TEXT DEFAULT 'pending',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS webhook_events (
+                event_id     TEXT PRIMARY KEY,
+                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -1376,6 +1383,43 @@ def handle_parent(user_id: str, reply_token: str, msg: dict) -> None:
 
 # ── Webhook ──────────────────────────────────────────────────────────────────
 
+# Claude呼び出しで長時間かかる処理を背景で走らせるためのエグゼキュータ。
+# LINE webhook は即 200 OK を返し、再送による二重処理を避ける。
+_webhook_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="webhook")
+
+
+def record_webhook_event(event_id: str) -> bool:
+    """webhook_events に event_id を INSERT。新規なら True、重複なら False。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO webhook_events (event_id) VALUES (?)",
+            (event_id,),
+        )
+        return cur.rowcount > 0
+
+
+def _process_event(event: dict) -> None:
+    """1イベントをディスパッチ。例外はログするがプロセスを落とさない。"""
+    if event.get("type") != "message":
+        return
+    user_id = event["source"]["userId"]
+    reply_token = event["replyToken"]
+    msg = event["message"]
+    try:
+        if user_id == PARENT_USER_ID:
+            handle_parent(user_id, reply_token, msg)
+        elif user_id == CHILD_USER_ID:
+            handle_child(user_id, reply_token, msg)
+        else:
+            reply(reply_token, f"このボットは登録済みのユーザーのみ使用できます。\nあなたのID: {user_id}")
+    except Exception:
+        traceback.print_exc()
+        try:
+            push(user_id, "エラーが発生しました。もう一度試してください。")
+        except Exception:
+            traceback.print_exc()
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     signature = request.headers.get("X-Line-Signature", "")
@@ -1384,21 +1428,11 @@ def webhook():
         abort(400)
 
     for event in json.loads(body).get("events", []):
-        if event.get("type") != "message":
+        event_id = event.get("webhookEventId")
+        if event_id and not record_webhook_event(event_id):
+            # 同じイベントを既に処理済み → LINE再送/重複配信を弾く
             continue
-        user_id = event["source"]["userId"]
-        reply_token = event["replyToken"]
-        msg = event["message"]
-        try:
-            if user_id == PARENT_USER_ID:
-                handle_parent(user_id, reply_token, msg)
-            elif user_id == CHILD_USER_ID:
-                handle_child(user_id, reply_token, msg)
-            else:
-                reply(reply_token, f"このボットは登録済みのユーザーのみ使用できます。\nあなたのID: {user_id}")
-        except Exception:
-            traceback.print_exc()
-            push(user_id, "エラーが発生しました。もう一度試してください。")
+        _webhook_executor.submit(_process_event, event)
 
     return "OK", 200
 
