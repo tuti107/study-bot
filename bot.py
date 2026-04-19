@@ -611,18 +611,19 @@ def get_weekly_summary(user_id: str) -> list[dict]:
 
 def get_recent_topics_summary(user_id: str, days: int = 30) -> str:
     """直近days日の学習トピックと正答率・定着度をサマリ文字列で返す（プロンプト注入用）。"""
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            f"""SELECT DATE(ss.created_at,'localtime') as day, t.subject, t.unit,
-                       lr.score, lr.total, t.mastery
-                FROM learning_records lr
-                JOIN sessions ss ON lr.session_id = ss.id
-                JOIN topics t ON lr.topic_id = t.id
-                WHERE lr.user_id=? AND DATE(ss.created_at,'localtime') >= DATE('now','localtime','-{int(days)} days')
-                  AND lr.status='done'
-                ORDER BY ss.created_at DESC LIMIT 30""",
-            (user_id,),
+            """SELECT DATE(ss.created_at,'localtime') as day, t.subject, t.unit,
+                      lr.score, lr.total, t.mastery
+               FROM learning_records lr
+               JOIN sessions ss ON lr.session_id = ss.id
+               JOIN topics t ON lr.topic_id = t.id
+               WHERE lr.user_id=? AND DATE(ss.created_at,'localtime') >= ?
+                 AND lr.status='done'
+               ORDER BY ss.created_at DESC LIMIT 30""",
+            (user_id, cutoff),
         ).fetchall()
     if not rows:
         return ""
@@ -639,19 +640,20 @@ def get_recent_topics_summary(user_id: str, days: int = 30) -> str:
 def get_weak_points(user_id: str, days: int = 7, limit: int = 3) -> list[dict]:
     """直近days日の誤答を (科目, 単元, 概念キー) で集計し件数順に返す。
     各エントリに最新の誤答例（teaching_note含む）と mistake_category 分布を添える。"""
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            f"""SELECT qa.question_text, qa.student_answer, qa.correct_answer,
-                       qa.mistake_category, qa.teaching_note, qa.concept_keys,
-                       qa.attempted_at, t.subject, t.unit
-                FROM question_attempts qa
-                JOIN learning_records lr ON qa.learning_record_id = lr.id
-                JOIN topics t ON qa.topic_id = t.id
-                WHERE lr.user_id=? AND qa.is_correct=0
-                  AND DATE(qa.attempted_at,'localtime') >= DATE('now','localtime','-{int(days)} days')
-                ORDER BY qa.attempted_at DESC""",
-            (user_id,),
+            """SELECT qa.question_text, qa.student_answer, qa.correct_answer,
+                      qa.mistake_category, qa.teaching_note, qa.concept_keys,
+                      qa.attempted_at, t.subject, t.unit
+               FROM question_attempts qa
+               JOIN learning_records lr ON qa.learning_record_id = lr.id
+               JOIN topics t ON qa.topic_id = t.id
+               WHERE lr.user_id=? AND qa.is_correct=0
+                 AND DATE(qa.attempted_at,'localtime') >= ?
+               ORDER BY qa.attempted_at DESC""",
+            (user_id, cutoff),
         ).fetchall()
     groups: dict[tuple, dict] = {}
     for r in rows:
@@ -682,19 +684,20 @@ def get_weak_points(user_id: str, days: int = 7, limit: int = 3) -> list[dict]:
 def get_mastery_trend(user_id: str, days: int = 7) -> list[dict]:
     """直近days日と直前days日で、トピックごとの正答率を比較。
     recent_ratio / prior_ratio / delta を付与。attempts が無い側は None。"""
+    cutoff_range = (date.today() - timedelta(days=days * 2)).isoformat()
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            f"""SELECT qa.topic_id, t.subject, t.unit, t.mastery AS current_mastery,
-                       qa.is_correct, DATE(qa.attempted_at,'localtime') AS day
-                FROM question_attempts qa
-                JOIN learning_records lr ON qa.learning_record_id = lr.id
-                JOIN topics t ON qa.topic_id = t.id
-                WHERE lr.user_id=?
-                  AND DATE(qa.attempted_at,'localtime') >= DATE('now','localtime','-{int(days)*2} days')""",
-            (user_id,),
+            """SELECT qa.topic_id, t.subject, t.unit, t.mastery AS current_mastery,
+                      qa.is_correct, DATE(qa.attempted_at,'localtime') AS day
+               FROM question_attempts qa
+               JOIN learning_records lr ON qa.learning_record_id = lr.id
+               JOIN topics t ON qa.topic_id = t.id
+               WHERE lr.user_id=?
+                 AND DATE(qa.attempted_at,'localtime') >= ?""",
+            (user_id, cutoff_range),
         ).fetchall()
-    cutoff = (date.today() - timedelta(days=days)).isoformat()
     topics: dict[int, dict] = {}
     for r in rows:
         t = topics.setdefault(r["topic_id"], {
@@ -721,19 +724,20 @@ def get_mastery_trend(user_id: str, days: int = 7) -> list[dict]:
 
 def get_recent_teaching_notes(user_id: str, days: int = 7, limit: int = 10) -> list[dict]:
     """直近days日の teaching_note を新しい順に（誤答優先で）取得。"""
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            f"""SELECT qa.question_text, qa.student_answer, qa.is_correct,
-                       qa.mistake_category, qa.teaching_note,
-                       t.subject, t.unit
-                FROM question_attempts qa
-                JOIN learning_records lr ON qa.learning_record_id = lr.id
-                JOIN topics t ON qa.topic_id = t.id
-                WHERE lr.user_id=? AND qa.teaching_note IS NOT NULL AND qa.teaching_note<>''
-                  AND DATE(qa.attempted_at,'localtime') >= DATE('now','localtime','-{int(days)} days')
-                ORDER BY qa.is_correct ASC, qa.attempted_at DESC LIMIT ?""",
-            (user_id, limit),
+            """SELECT qa.question_text, qa.student_answer, qa.is_correct,
+                      qa.mistake_category, qa.teaching_note,
+                      t.subject, t.unit
+               FROM question_attempts qa
+               JOIN learning_records lr ON qa.learning_record_id = lr.id
+               JOIN topics t ON qa.topic_id = t.id
+               WHERE lr.user_id=? AND qa.teaching_note IS NOT NULL AND qa.teaching_note<>''
+                 AND DATE(qa.attempted_at,'localtime') >= ?
+               ORDER BY qa.is_correct ASC, qa.attempted_at DESC LIMIT ?""",
+            (user_id, cutoff, limit),
         ).fetchall()
     return [dict(r) for r in rows]
 
