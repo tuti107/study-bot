@@ -18,6 +18,17 @@
 
 ### 1.1 ファイル: `student_profile.json`
 
+**セットアップ手順** (初回のみ):
+
+```bash
+cp student_profile.example.json student_profile.json
+# 続いて student_profile.json を実データで編集
+```
+
+`student_profile.json` は児童の個人情報（氏名・学年・特性メモ等）を含むため
+`.gitignore` 済み。リポジトリには `student_profile.example.json` のみが
+サンプル値で追跡されている。**実データを commit しないこと。**
+
 ```json
 {
   "name": "○○",

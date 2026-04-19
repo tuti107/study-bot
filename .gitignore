@@ -6,3 +6,4 @@ __pycache__/
 ngrok.exe
 logs/
 images/
+student_profile.json
