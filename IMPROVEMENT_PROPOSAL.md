@@ -85,8 +85,8 @@
   [bot.py:534](bot.py#L534), [bot.py:564](bot.py#L564), [bot.py:606](bot.py#L606), [bot.py:646](bot.py#L646) — `int(days)` キャストはしているが「SQL にユーザ値を f-string で流し込むパターン」が複数ヶ所に散在し、将来のリファクタで容易に脆弱性化する。`?` プレースホルダに統一し、`date` 演算は Python 側で済ませる。
 - **C-3. (Medium) `format_due_reviews_for_prompt` で N+1 クエリ**
   [bot.py:378-408](bot.py#L378-L408) — 復習候補ごとに 1 回ずつ `question_attempts` を検索。1 回の JOIN + ウィンドウ関数でまとめ可能。
-- **C-4. (Medium) 画像 base64 化が都度再実行**
-  `analyze_step_a` と `grade_answers` で同一画像を再読込＋再エンコード。Anthropic Files API 利用で in-memory キャッシュ化、またはセッションスコープのメモ化が可能。
+- **C-4. (Low) 画像 base64 化ごとのペイロードオーバーヘッド** — **対応見送り (2026-04-21)**
+  当初は「`analyze_step_a` と `grade_answers` で同一画像を再エンコード」と記載したが、実装を精査した結果、両者は **別画像** (ノート画像と答案画像) を扱っており「同画像の再送」は発生していない。残る改善余地は base64 の約 +33% オーバーヘッド削減のみで効果が限定的。一方、Anthropic Files API に切り替えると児童ノート画像 (筆跡・氏名等の PII) が Anthropic 側に既定 30 日前後保存されることになり、本 bot のプライバシー方針 (A-5 と同趣旨) と相反する。費用対効果と PII リスクを比較のうえ **P2-4 は見送り**。再検討は Anthropic の保持期限短縮契約が可能になった時点に限る。
 - **C-5. (Medium) `images/` の保持期限・DB レコードのアーカイブ方針なし**
   長期運用で必ず破綻。プライバシー面からも 30 日程度で削除が望ましい。
 - **C-6. (Medium) 日次／週次レポートを毎回 Claude で再生成**
@@ -237,8 +237,15 @@ CREATE INDEX IF NOT EXISTS ix_review_queue_user ON review_queue(user_id, status,
 ### P2-3. レポートキャッシュ  (対応: C-6)
 `daily_reports(user_id, day, records_hash, body, created_at)` を追加し、同日・同データなら再利用。
 
-### P2-4. Anthropic Files API への移行  (対応: C-4)
-1 画像 1 回アップロード → `file_id` でステップ A/B/採点を共有。コストとレイテンシを削減。
+### P2-4. Anthropic Files API への移行  (対応: C-4) — **見送り (2026-04-21)**
+当初は「1 画像 1 回アップロード → `file_id` でステップ A/B/採点を共有」でコスト・レイテンシ削減を狙っていたが、実装精査により以下の理由で見送りを決定:
+
+- **前提の誤認**: ステップ A (ノート画像) と採点 (答案画像) は別画像で、ステップ B は画像を使わない。「同画像を共有」というメリットは発生しない。
+- **残るメリットが限定的**: base64 オーバーヘッド (約 +33%) とペイロード削減のみ。LINE→bot→Claude のレイテンシ改善は副次的。
+- **PII リスクが上回る**: Files API は児童ノート画像を Anthropic 側に既定 30 日前後保存する。現状の inline base64 は処理完了後に Anthropic 側で長期保持されない建前で、児童 PII (筆跡・氏名) の滞在時間を短く保てる。プライバシー方針に相反する変更はコスト削減のみを理由に採用すべきでない。
+- **副次リスク**: `file_id` ライフサイクル管理、SDK バージョン依存の強化、web_search tool との併用未検証、ロールバック困難性。
+
+再検討条件: Anthropic との保持期限短縮契約が可能になった場合、または bot が同一画像を複数回 Claude に送るシナリオ (例: 回答再採点・複数モデルでの照合) が追加された場合。
 
 ### P2-5. 監視 / アラート
 - `logs/` を日次で grep → `ERROR` 検知時に親ユーザに push 通知
@@ -256,7 +263,7 @@ CREATE INDEX IF NOT EXISTS ix_review_queue_user ON review_queue(user_id, status,
 | 1 週目 (〜2026-04-26) | P0-1〜P0-4 完了 (認証情報ローテ / PII 除去 / debug off / webhook 非同期・冪等化) |
 | 2 週目 | P1-1〜P1-4 (timeout・tx・index・param 化) |
 | 3 週目 | P1-5, P1-6 + P2-1 (画像保持・ログ衛生・マイグレーション基盤) |
-| 4 週目 | P2-2〜P2-6 (インジェクション緩和・Files API・監視) |
+| 4 週目 | P2-2・P2-3・P2-5・P2-6 (インジェクション緩和・レポートキャッシュ・監視・構造化ログ)。P2-4 は見送り |
 
 ---
 
