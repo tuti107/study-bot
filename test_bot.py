@@ -648,6 +648,60 @@ except Exception as e:
 
 
 # ─────────────────────────────────────────────
+print("\n=== P2-1. schema_migrations ランナー ===")
+try:
+    import tempfile
+    # ケース1: 新規 DB → 0001 が記録される
+    _saved = bot.DB_PATH
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        fresh = tf.name
+    try:
+        bot.DB_PATH = fresh
+        applied_1 = bot.run_migrations()
+        assert applied_1 == [1], f"新規 DB で 0001 が適用されていない: {applied_1}"
+        with sqlite3.connect(fresh) as c:
+            rows = list(c.execute("SELECT version, name FROM schema_migrations"))
+        assert rows == [(1, "0001_init.sql")], f"schema_migrations 不正: {rows}"
+        applied_2 = bot.run_migrations()
+        assert applied_2 == [], f"2 回目に再適用されてしまった: {applied_2}"
+        ok("新規 DB でランナーが 0001 を 1 回だけ適用")
+    finally:
+        bot.DB_PATH = _saved
+        try:
+            os.remove(fresh)
+        except OSError:
+            pass
+
+    # ケース2: レガシー DB（旧 init_db 相当でテーブルだけ存在、schema_migrations 不在）
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        legacy = tf.name
+    try:
+        with sqlite3.connect(legacy) as c:
+            c.execute("CREATE TABLE credits (user_id TEXT PRIMARY KEY, balance INTEGER DEFAULT 0)")
+            c.execute("INSERT INTO credits (user_id, balance) VALUES ('legacy_user', 42)")
+        bot.DB_PATH = legacy
+        applied_legacy = bot.run_migrations()
+        assert applied_legacy == [1], f"レガシー DB で 0001 が登録されなかった: {applied_legacy}"
+        with sqlite3.connect(legacy) as c:
+            bal = c.execute("SELECT balance FROM credits WHERE user_id='legacy_user'").fetchone()[0]
+            sm = list(c.execute("SELECT version FROM schema_migrations"))
+        assert bal == 42, f"レガシーデータが破壊された: {bal}"
+        assert sm == [(1,)], f"schema_migrations 不正: {sm}"
+        ok("レガシー DB もデータを壊さず 0001 を登録")
+    finally:
+        bot.DB_PATH = _saved
+        try:
+            os.remove(legacy)
+        except OSError:
+            pass
+
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    ng("P2-1 schema_migrations ランナー", str(e))
+
+
+# ─────────────────────────────────────────────
 print(f"\n{'='*40}")
 print(f"結果: {passed}件成功 / {failed}件失敗")
 if failed == 0:
