@@ -648,6 +648,84 @@ except Exception as e:
 
 
 # ─────────────────────────────────────────────
+print("\n=== P2-5. ヘルスチェック (check_health) ===")
+try:
+    import tempfile, shutil
+    from datetime import date as _date
+    fixed = _date(2026, 4, 20)
+    tmp_logs = tempfile.mkdtemp(prefix="studybot_logs_")
+    tmp_images = tempfile.mkdtemp(prefix="studybot_imgs_")
+    orig_logs_dir = bot.LOGS_DIR
+    orig_images_dir = bot.IMAGE_DIR
+    orig_db = bot.DB_PATH
+    orig_db_limit = bot.HEALTH_DB_LIMIT_MB
+    orig_img_limit = bot.HEALTH_IMAGES_LIMIT_MB
+    pushes: list[tuple[str, str]] = []
+    def fake_push(uid, text):
+        pushes.append((uid, text))
+
+    try:
+        bot.LOGS_DIR = tmp_logs
+        bot.IMAGE_DIR = tmp_images
+        bot.DB_PATH = TEST_DB
+
+        # ケース1: ログ無し・サイズ閾値内 → push されない
+        bot.HEALTH_DB_LIMIT_MB = 500
+        bot.HEALTH_IMAGES_LIMIT_MB = 1024
+        m = bot.check_health(push_fn=fake_push, now=fixed)
+        assert m["alerted"] is False and m["error_count"] == 0
+        assert pushes == [], f"正常系で push された: {pushes}"
+        ok("異常なしで通知されない")
+
+        # ケース2: ログに ERROR 行 → push される
+        log_path = os.path.join(tmp_logs, "bot_20260420.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("2026-04-20 12:00:00 INFO [studybot] normal line\n")
+            f.write("2026-04-20 12:00:01 ERROR [studybot] event_processing_failed user_id=Ux\n")
+            f.write("2026-04-20 12:00:02 CRITICAL [studybot] push_failure_notify_failed\n")
+        m = bot.check_health(push_fn=fake_push, now=fixed)
+        assert m["error_count"] == 2, f"ERROR 行数不正: {m}"
+        assert m["alerted"] is True
+        assert len(pushes) == 1 and pushes[0][0] == bot.PARENT_USER_ID
+        assert "ERROR/CRITICAL" in pushes[0][1]
+        ok("ログ異常検出で親に通知")
+
+        # ケース3: DB 閾値超過 → push される
+        pushes.clear()
+        # DB ファイル (test_bot.db) のサイズを超えない小さい閾値にする
+        bot.HEALTH_DB_LIMIT_MB = 0  # 必ず超過
+        os.remove(log_path)  # ログは空に戻す
+        m = bot.check_health(push_fn=fake_push, now=fixed)
+        assert m["alerted"] is True
+        assert len(pushes) == 1 and "DB サイズ" in pushes[0][1]
+        ok("DB サイズ超過で親に通知")
+
+        # ケース4: images/ 閾値超過
+        pushes.clear()
+        bot.HEALTH_DB_LIMIT_MB = 500
+        bot.HEALTH_IMAGES_LIMIT_MB = 0
+        with open(os.path.join(tmp_images, "dummy.jpg"), "wb") as f:
+            f.write(b"\0" * 1024)
+        m = bot.check_health(push_fn=fake_push, now=fixed)
+        assert m["alerted"] is True and "images/" in pushes[0][1]
+        ok("images/ サイズ超過で親に通知")
+
+    finally:
+        bot.LOGS_DIR = orig_logs_dir
+        bot.IMAGE_DIR = orig_images_dir
+        bot.DB_PATH = orig_db
+        bot.HEALTH_DB_LIMIT_MB = orig_db_limit
+        bot.HEALTH_IMAGES_LIMIT_MB = orig_img_limit
+        shutil.rmtree(tmp_logs, ignore_errors=True)
+        shutil.rmtree(tmp_images, ignore_errors=True)
+
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    ng("P2-5 check_health", str(e))
+
+
+# ─────────────────────────────────────────────
 print("\n=== P2-2. プロンプトインジェクション緩和 ===")
 try:
     # 1) _project_dict は許可キーのみを残し、注入された余分キーを落とす

@@ -43,6 +43,10 @@ PROFILE_PATH = os.path.join(os.path.dirname(__file__), "student_profile.json")
 SUPERVISOR_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "supervisor_profile.json")
 CREDIT_PER_CORRECT = 10
 IMAGE_RETENTION_DAYS = int(os.environ.get("IMAGE_RETENTION_DAYS", "30"))
+# P2-5 監視しきい値 (環境変数で調整可)
+HEALTH_DB_LIMIT_MB = int(os.environ.get("HEALTH_DB_LIMIT_MB", "500"))
+HEALTH_IMAGES_LIMIT_MB = int(os.environ.get("HEALTH_IMAGES_LIMIT_MB", "1024"))
+HEALTH_MAX_ERROR_LINES = int(os.environ.get("HEALTH_MAX_ERROR_LINES", "5"))
 
 # supervisor の仮想子ユーザーID（sv-child:<LINE_ID>）。本番息子データと接頭辞で分離。
 def _sv_child_id(supervisor_line_id: str) -> str:
@@ -1989,6 +1993,82 @@ def webhook():
     return "OK", 200
 
 
+# ── 監視 (P2-5) ──────────────────────────────────────────────────────────────
+
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    if not os.path.isdir(path):
+        return 0
+    for name in os.listdir(path):
+        p = os.path.join(path, name)
+        try:
+            if os.path.isfile(p):
+                total += os.path.getsize(p)
+        except OSError:
+            continue
+    return total
+
+
+def _scan_log_errors(log_path: str, max_lines: int) -> list[str]:
+    if not os.path.isfile(log_path):
+        return []
+    hits: list[str] = []
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if " ERROR " in line or " CRITICAL " in line:
+                hits.append(line.rstrip("\n"))
+                if len(hits) >= max_lines:
+                    break
+    return hits
+
+
+def check_health(push_fn=None, now: date | None = None) -> dict:
+    """ログの ERROR/CRITICAL 行と DB/画像ディレクトリの容量を点検し、
+    しきい値を超えた項目があれば親ユーザーに push 通知する。
+    戻り値は観測メトリクス (テスト・ログ用途)。"""
+    now = now or date.today()
+    log_path = os.path.join(LOGS_DIR, f"bot_{now.strftime('%Y%m%d')}.log")
+    errors = _scan_log_errors(log_path, HEALTH_MAX_ERROR_LINES)
+    db_bytes = os.path.getsize(DB_PATH) if os.path.isfile(DB_PATH) else 0
+    images_bytes = _dir_size_bytes(IMAGE_DIR)
+    db_mb = db_bytes / (1024 * 1024)
+    images_mb = images_bytes / (1024 * 1024)
+
+    issues: list[str] = []
+    if errors:
+        issues.append(f"⚠️ ログに ERROR/CRITICAL を {len(errors)} 件検出")
+        for ln in errors:
+            issues.append(f"  {ln[:200]}")
+    if db_mb > HEALTH_DB_LIMIT_MB:
+        issues.append(f"⚠️ DB サイズ {db_mb:.1f}MB > 閾値 {HEALTH_DB_LIMIT_MB}MB")
+    if images_mb > HEALTH_IMAGES_LIMIT_MB:
+        issues.append(f"⚠️ images/ サイズ {images_mb:.1f}MB > 閾値 {HEALTH_IMAGES_LIMIT_MB}MB")
+
+    metrics = {
+        "error_count": len(errors),
+        "db_mb": round(db_mb, 2),
+        "images_mb": round(images_mb, 2),
+        "alerted": bool(issues),
+    }
+    logger.info(
+        "health_check error_count=%d db_mb=%.2f images_mb=%.2f alerted=%s",
+        metrics["error_count"], metrics["db_mb"], metrics["images_mb"], metrics["alerted"],
+    )
+
+    if issues:
+        body = (
+            f"📡 【StudyBot ヘルスチェック】{now.isoformat()}\n"
+            + "\n".join(issues)
+            + f"\n\nDB: {db_mb:.1f}MB / images: {images_mb:.1f}MB"
+        )
+        fn = push_fn or push
+        try:
+            fn(PARENT_USER_ID, body[:4900])
+        except Exception:
+            logger.exception("health_check_push_failed")
+    return metrics
+
+
 # ── スケジューラ ──────────────────────────────────────────────────────────────
 
 def start_scheduler() -> None:
@@ -1999,6 +2079,8 @@ def start_scheduler() -> None:
     scheduler.add_job(send_weekly_report, "cron", day_of_week="sun", hour=REPORT_HOUR + 1, minute=0)
     # 毎日 3:00 に古い画像を削除 (P1-5)
     scheduler.add_job(cleanup_old_images, "cron", hour=3, minute=0)
+    # 毎日 6:00 にヘルスチェック (P2-5)
+    scheduler.add_job(check_health, "cron", hour=6, minute=0)
     scheduler.start()
 
 
