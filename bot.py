@@ -1340,10 +1340,8 @@ def grade_answers(image_path: str, questions: list) -> list[dict]:
     )
     return _parse_json_or_debug(_collect_text(message), "grade_answers")
 
-def generate_daily_report(records: list[dict], balance: int,
-                          user_id: str | None = None) -> str:
-    if not records:
-        return "本日の学習記録はありません。"
+def _build_daily_report_prompt(records: list[dict], balance: int,
+                               user_id: str | None) -> str:
     summary_text = "\n".join(
         f"・{r['subject_name']}「{r.get('unit') or ''}」: {r['score']}/{r['total']}問正解"
         f" — {r['summary'][:40]}"
@@ -1365,10 +1363,7 @@ def generate_daily_report(records: list[dict], balance: int,
                 for n in notes
             )
 
-    message = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=600,
-        messages=[{"role": "user", "content": f"""{build_profile_context()}
+    return f"""{build_profile_context()}
 
 この学習者の保護者向けに、本日の学習レポートを作成してください。
 
@@ -1388,9 +1383,55 @@ def generate_daily_report(records: list[dict], balance: int,
   1) 本日の総評（どの単元がどの程度できたか・具体的な褒めどころ）
   2) 気になる誤答の傾向（弱点ブロックと所見から1点だけ選んで深掘り）
   3) 明日やってほしい具体的な声かけ・取り組み（1つだけ、実行可能なもの）
-- 丸暗記ではなく「なぜ」を問う家庭教師の目線を保つこと"""}],
+- 丸暗記ではなく「なぜ」を問う家庭教師の目線を保つこと"""
+
+
+def _get_cached_daily_report(user_id: str, day: str, records_hash: str) -> str | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT body FROM daily_reports WHERE user_id=? AND day=? AND records_hash=?",
+            (user_id, day, records_hash),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def _store_daily_report(user_id: str, day: str, records_hash: str, body: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO daily_reports (user_id, day, records_hash, body) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, day, records_hash, body),
+        )
+
+
+def generate_daily_report(records: list[dict], balance: int,
+                          user_id: str | None = None) -> str:
+    if not records:
+        return "本日の学習記録はありません。"
+    prompt = _build_daily_report_prompt(records, balance, user_id)
+
+    # キャッシュは user_id が特定できる場合のみ利用 (キーに user_id を含むため)。
+    day = date.today().isoformat()
+    records_hash = None
+    if user_id:
+        records_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        cached = _get_cached_daily_report(user_id, day, records_hash)
+        if cached is not None:
+            logger.info(
+                "daily_report_cache_hit user_id=%s day=%s hash=%s",
+                user_id, day, records_hash[:12],
+            )
+            return cached
+
+    message = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=600,
+        messages=[{"role": "user", "content": prompt}],
     )
-    return _collect_text(message).strip()
+    body = _collect_text(message).strip()
+    if user_id and records_hash:
+        _store_daily_report(user_id, day, records_hash, body)
+    return body
 
 
 def generate_weekly_report(records: list[dict], balance: int,

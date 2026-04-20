@@ -648,6 +648,78 @@ except Exception as e:
 
 
 # ─────────────────────────────────────────────
+print("\n=== P2-3. daily_reports キャッシュ ===")
+try:
+    from datetime import date as _date
+    P23_USER = "U_p23_child"
+    today = _date.today().isoformat()
+    records = [{
+        "subject_name": "算数", "unit": "分数のかけ算",
+        "score": 2, "total": 3, "summary": "約分忘れ",
+    }]
+
+    # Claude モックでコール数を数える
+    class _FakeText:
+        def __init__(self, t):
+            self.type = "text"
+            self.text = t
+    class _FakeMsg:
+        def __init__(self, t): self.content = [_FakeText(t)]
+    calls = {"n": 0}
+    class _FakeMessages:
+        def create(self, **kw):
+            calls["n"] += 1
+            return _FakeMsg(f"mock-report-{calls['n']}")
+    class _FakeClaude:
+        messages = _FakeMessages()
+    orig_claude = bot.claude
+    bot.claude = _FakeClaude()
+
+    # 既存キャッシュをクリア
+    with sqlite3.connect(TEST_DB) as c:
+        c.execute("DELETE FROM daily_reports WHERE user_id=?", (P23_USER,))
+
+    try:
+        # 1回目: Claude 呼び出しが発生し、キャッシュに保存される
+        r1 = bot.generate_daily_report(records, balance=50, user_id=P23_USER)
+        assert calls["n"] == 1, f"初回で Claude が呼ばれていない: {calls}"
+        assert r1 == "mock-report-1"
+        with sqlite3.connect(TEST_DB) as c:
+            n_cache = c.execute(
+                "SELECT COUNT(*) FROM daily_reports WHERE user_id=? AND day=?",
+                (P23_USER, today),
+            ).fetchone()[0]
+        assert n_cache == 1, f"キャッシュ未保存: {n_cache}"
+        ok("初回で Claude 呼び出し + キャッシュ保存")
+
+        # 2回目: 同一入力 → キャッシュヒット (Claude 呼ばれない)
+        r2 = bot.generate_daily_report(records, balance=50, user_id=P23_USER)
+        assert calls["n"] == 1, f"同一入力でも Claude が再度呼ばれた: {calls}"
+        assert r2 == r1
+        ok("同一入力でキャッシュヒット (Claude 呼び出し回避)")
+
+        # 3回目: balance 変化 → プロンプト差分 → キャッシュミス
+        r3 = bot.generate_daily_report(records, balance=60, user_id=P23_USER)
+        assert calls["n"] == 2, f"入力差分時に Claude が呼ばれなかった: {calls}"
+        assert r3 == "mock-report-2"
+        ok("入力差分でキャッシュミス (再生成)")
+
+        # 4回目: user_id=None → キャッシュ非利用 (常に Claude を呼ぶ)
+        r4 = bot.generate_daily_report(records, balance=50, user_id=None)
+        assert calls["n"] == 3, f"user_id=None でもキャッシュに乗った: {calls}"
+        ok("user_id=None はキャッシュ対象外")
+    finally:
+        bot.claude = orig_claude
+        with sqlite3.connect(TEST_DB) as c:
+            c.execute("DELETE FROM daily_reports WHERE user_id=?", (P23_USER,))
+
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    ng("P2-3 daily_reports キャッシュ", str(e))
+
+
+# ─────────────────────────────────────────────
 print("\n=== P2-1. schema_migrations ランナー ===")
 try:
     import tempfile
@@ -658,13 +730,15 @@ try:
     try:
         bot.DB_PATH = fresh
         applied_1 = bot.run_migrations()
-        assert applied_1 == [1], f"新規 DB で 0001 が適用されていない: {applied_1}"
+        assert 1 in applied_1, f"新規 DB で 0001 が適用されていない: {applied_1}"
         with sqlite3.connect(fresh) as c:
-            rows = list(c.execute("SELECT version, name FROM schema_migrations"))
-        assert rows == [(1, "0001_init.sql")], f"schema_migrations 不正: {rows}"
+            rows = sorted(c.execute("SELECT version, name FROM schema_migrations"))
+        names = [n for _, n in rows]
+        assert (1, "0001_init.sql") in rows, f"schema_migrations に 0001 なし: {rows}"
+        assert all(n.endswith(".sql") for n in names), f"名称不正: {names}"
         applied_2 = bot.run_migrations()
         assert applied_2 == [], f"2 回目に再適用されてしまった: {applied_2}"
-        ok("新規 DB でランナーが 0001 を 1 回だけ適用")
+        ok("新規 DB でランナーが各 migration を 1 回だけ適用")
     finally:
         bot.DB_PATH = _saved
         try:
@@ -681,13 +755,13 @@ try:
             c.execute("INSERT INTO credits (user_id, balance) VALUES ('legacy_user', 42)")
         bot.DB_PATH = legacy
         applied_legacy = bot.run_migrations()
-        assert applied_legacy == [1], f"レガシー DB で 0001 が登録されなかった: {applied_legacy}"
+        assert 1 in applied_legacy, f"レガシー DB で 0001 が登録されなかった: {applied_legacy}"
         with sqlite3.connect(legacy) as c:
             bal = c.execute("SELECT balance FROM credits WHERE user_id='legacy_user'").fetchone()[0]
-            sm = list(c.execute("SELECT version FROM schema_migrations"))
+            sm = sorted(r[0] for r in c.execute("SELECT version FROM schema_migrations"))
         assert bal == 42, f"レガシーデータが破壊された: {bal}"
-        assert sm == [(1,)], f"schema_migrations 不正: {sm}"
-        ok("レガシー DB もデータを壊さず 0001 を登録")
+        assert 1 in sm, f"schema_migrations 不正: {sm}"
+        ok("レガシー DB もデータを壊さず全 migration を登録")
     finally:
         bot.DB_PATH = _saved
         try:
