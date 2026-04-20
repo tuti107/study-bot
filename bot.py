@@ -2,11 +2,11 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sqlite3
 import threading
 import time
-import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -54,6 +54,17 @@ _req_local = threading.local()
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 os.makedirs(IMAGE_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
+
+logger = logging.getLogger("studybot")
+if not logger.handlers:
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(_log_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 # ── DB ──────────────────────────────────────────────────────────────────────
@@ -1907,12 +1918,19 @@ def _process_event(event: dict) -> None:
     supervisor 用プロファイルを読めるようにする。finally で必ずクリアする。"""
     if event.get("type") != "message":
         return
+    event_id = event.get("webhookEventId")
     user_id = event["source"]["userId"]
     reply_token = event["replyToken"]
     msg = event["message"]
+    msg_type = msg.get("type")
 
     is_supervisor = bool(SUPERVISOR_USER_ID and user_id == SUPERVISOR_USER_ID)
     _req_local.profile_path = SUPERVISOR_PROFILE_PATH if is_supervisor else PROFILE_PATH
+
+    logger.info(
+        "event_dispatch event_id=%s user_id=%s msg_type=%s supervisor=%s",
+        event_id, user_id, msg_type, is_supervisor,
+    )
 
     try:
         if is_supervisor:
@@ -1924,11 +1942,17 @@ def _process_event(event: dict) -> None:
         else:
             reply(reply_token, f"このボットは登録済みのユーザーのみ使用できます。\nあなたのID: {user_id}")
     except Exception:
-        traceback.print_exc()
+        logger.exception(
+            "event_processing_failed event_id=%s user_id=%s msg_type=%s",
+            event_id, user_id, msg_type,
+        )
         try:
             push(user_id, "エラーが発生しました。もう一度試してください。")
         except Exception:
-            traceback.print_exc()
+            logger.exception(
+                "push_failure_notify_failed event_id=%s user_id=%s",
+                event_id, user_id,
+            )
     finally:
         _req_local.profile_path = None
 
@@ -1944,6 +1968,7 @@ def webhook():
         event_id = event.get("webhookEventId")
         if event_id and not record_webhook_event(event_id):
             # 同じイベントを既に処理済み → LINE再送/重複配信を弾く
+            logger.info("duplicate_webhook_event event_id=%s", event_id)
             continue
         _webhook_executor.submit(_process_event, event)
 
