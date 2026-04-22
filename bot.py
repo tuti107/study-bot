@@ -41,8 +41,19 @@ LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
 PRIZES_PATH = os.path.join(os.path.dirname(__file__), "prizes.json")
 PROFILE_PATH = os.path.join(os.path.dirname(__file__), "student_profile.json")
 SUPERVISOR_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "supervisor_profile.json")
-CREDIT_PER_CORRECT = 10
+CREDIT_PER_CORRECT = 10  # DEPRECATED: points 制 (SPEC §3.5) へ移行。旧テスト互換のため残置、新コードでは参照しない
 IMAGE_RETENTION_DAYS = int(os.environ.get("IMAGE_RETENTION_DAYS", "30"))
+
+# --- 小テスト構成 (SPEC_tutor.md §3.5) ---
+TIER_BASIC = "basic"
+TIER_APPLIED_MID = "applied_mid"
+TIER_APPLIED_HIGH = "applied_high"
+VALID_TIERS = (TIER_BASIC, TIER_APPLIED_MID, TIER_APPLIED_HIGH)
+TIER_POINTS = {TIER_BASIC: 10, TIER_APPLIED_MID: 15, TIER_APPLIED_HIGH: 5}
+QUESTIONS_PER_SUBJECT = 5
+MIN_ACCEPTABLE_QUESTIONS = 3  # これ未満なら retry 1 回
+ENCOURAGEMENT_MAX_LEN = 200
+POINTS_MIN, POINTS_MAX = 0, 100  # Claude の暴走値を clamp する安全レンジ
 # P2-5 監視しきい値 (環境変数で調整可)
 HEALTH_DB_LIMIT_MB = int(os.environ.get("HEALTH_DB_LIMIT_MB", "500"))
 HEALTH_IMAGES_LIMIT_MB = int(os.environ.get("HEALTH_IMAGES_LIMIT_MB", "1024"))
@@ -186,24 +197,30 @@ def save_learning_records(session_id: int, user_id: str, subjects_data: list) ->
                 unit=s.get("unit_guess"),
                 concept_keys=s.get("concept_keys"),
             )
+            points_total = sum(
+                int(q.get("points") or 0) for q in (s.get("questions") or [])
+            )
             conn.execute(
                 """INSERT INTO learning_records
                    (session_id, topic_id, user_id, source_summary,
-                    detected_difficulty, stumble_points, questions, total)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                    detected_difficulty, stumble_points, questions, total,
+                    points_total)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 (session_id, topic_id, user_id, s["summary"],
                  s.get("difficulty"),
                  json.dumps(s.get("stumble_points") or [], ensure_ascii=False),
                  json.dumps(s["questions"], ensure_ascii=False),
-                 len(s["questions"])),
+                 len(s["questions"]),
+                 points_total),
             )
 
 def get_next_unanswered(session_id: int) -> dict | None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            """SELECT lr.id AS id, lr.topic_id, lr.total, lr.questions,
-                      lr.source_summary, t.subject AS subject_name, t.unit
+            """SELECT lr.id AS id, lr.topic_id, lr.total, lr.points_total,
+                      lr.questions, lr.source_summary,
+                      t.subject AS subject_name, t.unit
                FROM learning_records lr
                JOIN topics t ON lr.topic_id = t.id
                WHERE lr.session_id=? AND lr.status='waiting' ORDER BY lr.id LIMIT 1""",
@@ -231,12 +248,19 @@ def save_question_attempts(learning_record_id: int, topic_id: int,
                            questions: list, results: list) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         for q, r in zip(questions, results):
+            tier = q.get("tier") if q.get("tier") in VALID_TIERS else None
+            try:
+                pts = int(q.get("points") or 0)
+            except (TypeError, ValueError):
+                pts = 0
+            earned = pts if r.get("correct") else 0
             conn.execute(
                 """INSERT INTO question_attempts
                    (learning_record_id, topic_id, question_text, correct_answer,
                     student_answer, is_correct, question_type, concept_keys,
-                    mistake_category, teaching_note, intent, origin)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    mistake_category, teaching_note, intent, origin,
+                    tier, points, earned_points)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (learning_record_id, topic_id, q.get("q", ""), q.get("a"),
                  r.get("student_answer"),
                  1 if r.get("correct") else 0,
@@ -245,7 +269,8 @@ def save_question_attempts(learning_record_id: int, topic_id: int,
                  r.get("mistake_category"),
                  r.get("teaching_note"),
                  q.get("intent"),
-                 q.get("origin", "today")),
+                 q.get("origin", "today"),
+                 tier, pts, earned),
             )
 
 REVIEW_INTERVALS = [1, 3, 7, 14, 30]  # 忘却曲線：正答で次の段階へ、30日超えで卒業
@@ -424,12 +449,19 @@ def apply_grading_results(user_id: str, default_topic_id: int,
     with _db_conn(conn) as conn:
         # 1. question_attempts 保存（各問ごとのトピックで）
         for q, r, tid in zip(questions, results, q_topics):
+            tier = q.get("tier") if q.get("tier") in VALID_TIERS else None
+            try:
+                pts = int(q.get("points") or 0)
+            except (TypeError, ValueError):
+                pts = 0
+            earned = pts if r.get("correct") else 0
             conn.execute(
                 """INSERT INTO question_attempts
                    (learning_record_id, topic_id, question_text, correct_answer,
                     student_answer, is_correct, question_type, concept_keys,
-                    mistake_category, teaching_note, intent, origin)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    mistake_category, teaching_note, intent, origin,
+                    tier, points, earned_points)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (learning_record_id, tid, q.get("q", ""), q.get("a"),
                  r.get("student_answer"),
                  1 if r.get("correct") else 0,
@@ -438,7 +470,8 @@ def apply_grading_results(user_id: str, default_topic_id: int,
                  r.get("mistake_category"),
                  r.get("teaching_note"),
                  q.get("intent"),
-                 q.get("origin", "today")),
+                 q.get("origin", "today"),
+                 tier, pts, earned),
             )
 
         # 2. review_queue 更新（トピック別にグループ化）
@@ -465,21 +498,30 @@ def apply_grading_results(user_id: str, default_topic_id: int,
 
 def finalize_grading(user_id: str, default_topic_id: int,
                      learning_record_id: int,
-                     questions: list, results: list,
-                     credit_per_correct: int) -> dict:
-    """採点反映・learning_record完了・クレジット加算を1トランザクションで実行する。
-    戻り値: {'score', 'total', 'earned', 'balance', 'by_topic'}"""
+                     questions: list, results: list) -> dict:
+    """採点反映・learning_record完了・クレジット加算を 1 トランザクションで実行する (P1-2)。
+    配点 (SPEC §3.5) ベース: earned_points = Σ(q.points if correct else 0)。
+    credits 加算は earned_points と同額 (1pt = 1cr)。
+    戻り値: {'score', 'total', 'points_earned', 'points_total',
+             'earned', 'balance', 'by_topic'}"""
     score = sum(1 for r in results if r.get("correct"))
-    earned = score * credit_per_correct
     total = len(results)
+    pairs = list(zip(questions, results))
+    points_total = sum(int(q.get("points") or 0) for q in questions)
+    points_earned = sum(
+        int(q.get("points") or 0) for q, r in pairs if r.get("correct")
+    )
+    earned = points_earned
     with sqlite3.connect(DB_PATH) as conn:
         summary = apply_grading_results(
             user_id, default_topic_id, learning_record_id,
             questions, results, conn=conn,
         )
         conn.execute(
-            "UPDATE learning_records SET score=?, status='done' WHERE id=?",
-            (score, learning_record_id),
+            """UPDATE learning_records
+               SET score=?, points_earned=?, status='done'
+               WHERE id=?""",
+            (score, points_earned, learning_record_id),
         )
         conn.execute(
             """INSERT INTO credits (user_id, balance) VALUES (?, ?)
@@ -492,8 +534,9 @@ def finalize_grading(user_id: str, default_topic_id: int,
             "SELECT balance FROM credits WHERE user_id=?", (user_id,),
         ).fetchone()[0]
     return {
-        "score": score, "total": total, "earned": earned,
-        "balance": balance, "by_topic": summary,
+        "score": score, "total": total,
+        "points_earned": points_earned, "points_total": points_total,
+        "earned": earned, "balance": balance, "by_topic": summary,
     }
 
 
@@ -522,7 +565,8 @@ def get_daily_summary(user_id: str, target_date: str) -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """SELECT t.subject AS subject_name, t.unit,
-                      lr.score, lr.total, lr.source_summary AS summary
+                      lr.score, lr.total, lr.points_earned, lr.points_total,
+                      lr.source_summary AS summary
                FROM learning_records lr
                JOIN sessions ss ON lr.session_id = ss.id
                JOIN topics t ON lr.topic_id = t.id
@@ -536,7 +580,8 @@ def get_weekly_summary(user_id: str) -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """SELECT DATE(ss.created_at,'localtime') as day, t.subject AS subject_name, t.unit,
-                      lr.score, lr.total, lr.source_summary AS summary
+                      lr.score, lr.total, lr.points_earned, lr.points_total,
+                      lr.source_summary AS summary
                FROM learning_records lr
                JOIN sessions ss ON lr.session_id = ss.id
                JOIN topics t ON lr.topic_id = t.id
@@ -1147,8 +1192,11 @@ _STEP_A_SUBJECT_KEYS = (
     "subject_name", "unit_guess", "concept_keys", "source_summary",
     "difficulty", "stumble_points", "research_notes", "links_to_past",
 )
-_STEP_B_SUBJECT_KEYS = ("subject_name", "today_questions", "review_questions")
-_STEP_B_QUESTION_KEYS = ("q", "a", "type", "concept_keys", "intent", "review_topic_id")
+_STEP_B_SUBJECT_KEYS = ("subject_name", "questions")
+_STEP_B_QUESTION_KEYS = (
+    "q", "a", "type", "concept_keys", "intent", "review_topic_id",
+    "tier", "points", "encouragement",
+)
 _GRADE_KEYS = (
     "q", "student_answer", "correct", "mistake_category",
     "concept_keys", "comment", "teaching_note",
@@ -1237,15 +1285,49 @@ def analyze_step_a(image_paths: list[str],
     return [_project_dict(s, _STEP_A_SUBJECT_KEYS) for s in subjects if isinstance(s, dict)]
 
 
-def generate_questions_step_b(step_a_output: list[dict],
-                              due_reviews_detail: str = "") -> list[dict]:
-    """ステップB: 分析結果＋復習候補から問題を生成。"""
-    subjects_block = json.dumps(step_a_output, ensure_ascii=False, indent=2)
-    message = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        system=STUDYBOT_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"""{build_profile_context()}
+def _normalize_questions(raw_questions: list) -> list[dict]:
+    """Claude 応答の質問配列を whitelist・enum・clamp・truncate で安全化する。
+    - tier が VALID_TIERS でないものは drop (インジェクション防御、A-7)
+    - points が int でなければ TIER_POINTS[tier] でフォールバック、レンジ外は clamp
+    - encouragement は applied_high 以外では None に強制、長さは ENCOURAGEMENT_MAX_LEN
+    - 並び順は [basic*, applied_mid*, applied_high*] に整列 (UI の固定表示順)
+    戻り値は filter 済み・truncate 前。呼び出し側で件数判定を行う。"""
+    cleaned: list[dict] = []
+    for q in raw_questions or []:
+        if not isinstance(q, dict):
+            continue
+        qp = _project_dict(q, _STEP_B_QUESTION_KEYS)
+        tier = qp.get("tier")
+        if tier not in VALID_TIERS:
+            continue
+        try:
+            pts = int(qp.get("points")) if qp.get("points") is not None else TIER_POINTS[tier]
+        except (TypeError, ValueError):
+            pts = TIER_POINTS[tier]
+        qp["points"] = max(POINTS_MIN, min(POINTS_MAX, pts))
+        enc = qp.get("encouragement")
+        if tier != TIER_APPLIED_HIGH:
+            qp["encouragement"] = None
+        elif isinstance(enc, str):
+            qp["encouragement"] = enc[:ENCOURAGEMENT_MAX_LEN]
+        else:
+            qp["encouragement"] = None
+        cleaned.append(qp)
+    order = {TIER_BASIC: 0, TIER_APPLIED_MID: 1, TIER_APPLIED_HIGH: 2}
+    cleaned.sort(key=lambda x: order.get(x.get("tier"), 99))
+    return cleaned
+
+
+def _tier_distribution(qs: list[dict]) -> dict[str, int]:
+    d = {t: 0 for t in VALID_TIERS}
+    for q in qs:
+        t = q.get("tier")
+        if t in d:
+            d[t] += 1
+    return d
+
+
+_STEP_B_PROMPT_TEMPLATE = """{profile_ctx}
 
 【タスク】
 以下の学習分析と復習候補から、本日の小テストを作ってください。
@@ -1254,73 +1336,157 @@ def generate_questions_step_b(step_a_output: list[dict],
 {subjects_block}
 
 【復習すべき項目（過去の誤答・スケジュール復習）】
-{due_reviews_detail or "（なし）"}
+{due_reviews}
 
-【出題方針】
-1. 本日の学習内容から、各科目につき3問
-   - stumble_points の1つ以上を意図的に問う
-   - 最低1問は「なぜそうなるか」「どういうときに使うか」を問う応用・推論問題
-   - 最低1問は基礎の確認問題
-2. 復習候補から最大2問（過去誤答を優先）
-   - 誤答した問題そのものではなく、同じ概念を問う別の問題にする
-   - 復習問題は、対応する復習候補の `review_topic_id=N` の N をそのまま
-     `review_topic_id` フィールドに整数で入れること（推測・創作禁止）
-   - 復習候補の科目と本日の学習の科目が一致しない場合は、復習候補の科目で
-     新しい subjects エントリを作り、そこに review_questions だけ入れてよい
-3. 学習者の学年で答えられる言葉で、問題文は簡潔に（集中力が短い）
+【出題方針】(必ず厳守)
+各科目ごとに、以下の構成で **ちょうど 5 問** を生成してください:
+  - 基本問題 (tier="basic", points=10) × 3 問
+      * 本日アップロードされた教科書・ノートの内容**のみ**から作成
+      * 過去の学習履歴や未習範囲は参照しない
+      * stumble_points のうち当日範囲で問えるものを優先
+  - 応用問題・中 (tier="applied_mid", points=15) × 1 問
+      * 当日の学習内容 + 過去の関連学習内容 (links_to_past や due_reviews) を組み合わせる
+      * 解けることを想定した難易度
+      * 該当する復習候補があれば review_topic_id=N を整数でセット (推測禁止)
+  - 応用問題・高 (tier="applied_high", points=5) × 1 問
+      * Q4 より一段高度な統合・推論を要する
+      * **解けなくてよい。より高い応用力への気付きを促す** 問題
+      * encouragement フィールドに「解けなくても落胆させない問いかけ型の励ましコメント」を記入
+      * 該当する復習候補があれば review_topic_id=N を整数でセット
 
-【出力形式】JSONのみ（マークダウン不要）。
+全問とも学習者の学年で読める言葉で、簡潔に (集中力が短い)。
+
 {{
   "subjects": [
     {{
-      "subject_name": "科目名（step_aの subject_name と一致させる）",
-      "today_questions": [
+      "subject_name": "科目名（step_a の subject_name と一致させる）",
+      "questions": [
         {{
           "q": "問題文",
           "a": "正解",
           "type": "knowledge|application|reasoning",
+          "tier": "basic|applied_mid|applied_high",
+          "points": 10,
           "concept_keys": ["概念"],
-          "intent": "この問題で何を確認したいか"
-        }}
-      ],
-      "review_questions": [
-        {{
-          "q": "問題文",
-          "a": "正解",
-          "type": "knowledge|application|reasoning",
-          "concept_keys": ["概念"],
-          "intent": "確認したいこと",
-          "review_topic_id": null
+          "intent": "この問題で何を確認したいか",
+          "review_topic_id": null,
+          "encouragement": null
         }}
       ]
     }}
   ]
-}}"""}],
+}}
+
+【出力形式】上記 JSON のみ (マークダウン不要)。"""
+
+
+_STEP_B_RETRY_PREFIX = """前回の出力は小テスト構成として不十分でした (各科目の問題数が {count} 問)。
+tier の内訳は {dist} でした。指定通り **各科目 basic×3 + applied_mid×1 + applied_high×1 の計 5 問**
+を必ず返してください。その他の指示・出力形式は同じです。
+
+"""
+
+
+def _call_step_b_claude(prompt: str) -> list:
+    """Claude を呼び出して subjects 配列を返す (raw)。失敗時は []。"""
+    message = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        system=STUDYBOT_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
     )
     raw = _parse_json_or_debug(_collect_text(message), "step_b")
-    subjects = raw.get("subjects", []) if isinstance(raw, dict) else []
-    projected: list[dict] = []
-    for s in subjects:
-        if not isinstance(s, dict):
-            continue
-        s2 = _project_dict(s, _STEP_B_SUBJECT_KEYS)
-        for key in ("today_questions", "review_questions"):
-            qs = s2.get(key) or []
-            s2[key] = [
-                _project_dict(q, _STEP_B_QUESTION_KEYS) for q in qs if isinstance(q, dict)
-            ]
-        projected.append(s2)
+    if isinstance(raw, dict):
+        subs = raw.get("subjects", [])
+        return subs if isinstance(subs, list) else []
+    return []
+
+
+def generate_questions_step_b(step_a_output: list[dict],
+                              due_reviews_detail: str = "") -> list[dict]:
+    """ステップB: 分析結果 + 復習候補から 5 問構成の小テストを生成する。
+
+    正規化 + retry ポリシー (SPEC §3.5):
+      - 各科目の問題数 < MIN_ACCEPTABLE_QUESTIONS (=3) なら 1 回 retry
+      - 3〜5 問は許容 (不足 tier は埋めない)
+      - 6 問以上は先頭 QUESTIONS_PER_SUBJECT (=5) に truncate
+    ログは件数・tier 分布のみ (A-4: 問題文・児童PII は出さない)。
+    """
+    subjects_block = json.dumps(step_a_output, ensure_ascii=False, indent=2)
+    base_prompt = _STEP_B_PROMPT_TEMPLATE.format(
+        profile_ctx=build_profile_context(),
+        subjects_block=subjects_block,
+        due_reviews=due_reviews_detail or "（なし）",
+    )
+
+    subjects_raw = _call_step_b_claude(base_prompt)
+    projected = _project_and_normalize_subjects(subjects_raw)
+
+    needs_retry = any(len(s.get("questions", [])) < MIN_ACCEPTABLE_QUESTIONS for s in projected)
+    if needs_retry:
+        min_count = min((len(s.get("questions", [])) for s in projected), default=0)
+        overall_dist = {t: 0 for t in VALID_TIERS}
+        for s in projected:
+            for k, v in _tier_distribution(s.get("questions", [])).items():
+                overall_dist[k] += v
+        logger.warning(
+            "step_b_retry subject_count=%d min_questions=%d tier_dist=%s",
+            len(projected), min_count, overall_dist,
+        )
+        retry_prompt = _STEP_B_RETRY_PREFIX.format(count=min_count, dist=overall_dist) + base_prompt
+        try:
+            subjects_raw2 = _call_step_b_claude(retry_prompt)
+            projected2 = _project_and_normalize_subjects(subjects_raw2)
+            # retry 結果が元より問題数が多ければ採用、そうでなければ元を保持
+            if sum(len(s.get("questions", [])) for s in projected2) > \
+               sum(len(s.get("questions", [])) for s in projected):
+                projected = projected2
+                logger.info("step_b_retry_accepted")
+            else:
+                logger.warning("step_b_retry_no_improvement")
+        except Exception:
+            logger.exception("step_b_retry_failed")
+
+    # truncate to 5 if exceeded
+    for s in projected:
+        qs = s.get("questions", [])
+        if len(qs) > QUESTIONS_PER_SUBJECT:
+            s["questions"] = qs[:QUESTIONS_PER_SUBJECT]
+
+    # 最終 tier 分布をログ (監視用、PII なし)
+    final_dist = {t: 0 for t in VALID_TIERS}
+    for s in projected:
+        for k, v in _tier_distribution(s.get("questions", [])).items():
+            final_dist[k] += v
+    logger.info("step_b_generated subjects=%d tier_dist=%s",
+                len(projected), final_dist)
     return projected
 
 
+def _project_and_normalize_subjects(raw_subjects: list) -> list[dict]:
+    """raw subjects 配列を whitelist + 質問正規化で projected に変換。"""
+    out: list[dict] = []
+    for s in raw_subjects or []:
+        if not isinstance(s, dict):
+            continue
+        sp = _project_dict(s, _STEP_B_SUBJECT_KEYS)
+        sp["questions"] = _normalize_questions(sp.get("questions") or [])
+        out.append(sp)
+    return out
+
+
 def merge_step_a_b(step_a: list[dict], step_b: list[dict]) -> list[dict]:
-    """ステップA/Bの結果を統合し、save_learning_records に渡せる形に整形。"""
-    b_by_subject = {s["subject_name"]: s for s in step_b}
+    """ステップA/B の結果を統合し、save_learning_records に渡せる形に整形。
+    Step B の `questions` は既に tier 順 (basic→applied_mid→applied_high) に整列済み。
+    review_topic_id が付いた問題は origin='review'、それ以外は origin='today'。"""
+    b_by_subject = {s.get("subject_name"): s for s in step_b}
     merged = []
     for a in step_a:
-        b = b_by_subject.get(a["subject_name"], {"today_questions": [], "review_questions": []})
-        today = [{**q, "origin": "today"} for q in b.get("today_questions", [])]
-        review = [{**q, "origin": "review"} for q in b.get("review_questions", [])]
+        b = b_by_subject.get(a["subject_name"], {"questions": []})
+        questions = []
+        for q in b.get("questions", []) or []:
+            origin = "review" if q.get("review_topic_id") else "today"
+            questions.append({**q, "origin": origin})
         merged.append({
             "subject_name": a["subject_name"],
             "unit_guess": a.get("unit_guess"),
@@ -1328,7 +1494,7 @@ def merge_step_a_b(step_a: list[dict], step_b: list[dict]) -> list[dict]:
             "summary": a.get("source_summary", ""),
             "difficulty": a.get("difficulty"),
             "stumble_points": a.get("stumble_points", []),
-            "questions": today + review,
+            "questions": questions,
         })
     return merged
 
@@ -1351,8 +1517,15 @@ def analyze_all_images(image_paths: list[str], user_id: str | None = None) -> li
 def grade_answers(image_path: str, questions: list) -> list[dict]:
     image_b64 = load_image_b64(image_path)
     qa_lines = []
+    tier_label = {
+        TIER_BASIC: "基本 (10点)",
+        TIER_APPLIED_MID: "応用・中 (15点)",
+        TIER_APPLIED_HIGH: "★チャレンジ 応用・高 (5点・解けなくて良い)",
+    }
     for i, q in enumerate(questions, 1):
         qa_lines.append(f"Q{i}. {q.get('q', '')}  正解: {q.get('a', '')}")
+        if q.get("tier") in VALID_TIERS:
+            qa_lines.append(f"    区分: {tier_label[q['tier']]}")
         if q.get("intent"):
             qa_lines.append(f"    出題意図: {q['intent']}")
         if q.get("concept_keys"):
@@ -1375,6 +1548,7 @@ def grade_answers(image_path: str, questions: list) -> list[dict]:
 - 誤答時のコメントは「ヒントのみ」。答えそのものや答えを直接示唆する表現は使わない
 - 学習者の学年・苦手傾向を踏まえ、優しく具体的に励ます
 - 誤答は原因を分類する（calc_error / concept_error / read_error / unknown / partial）
+- 「★チャレンジ 応用・高」の問題は解けなくても落胆させない。誤答時は問いかけ型の励ましコメントにすること
 
 【問題と正解】
 {qa_text}
@@ -1399,15 +1573,23 @@ def grade_answers(image_path: str, questions: list) -> list[dict]:
     return [_project_dict(r, _GRADE_KEYS) for r in raw if isinstance(r, dict)]
 
 
+def _format_record_score_line(r: dict) -> str:
+    """1 レコード分の成績行を組み立てる。points_total > 0 の新仕様レコードは点数併記、
+    旧レコード (points_total=0) は従来表示。"""
+    base = f"・{r['subject_name']}「{r.get('unit') or ''}」: {r['score']}/{r['total']}問正解"
+    pt_total = r.get("points_total") or 0
+    if pt_total > 0:
+        base += f" ({r.get('points_earned', 0)}/{pt_total}点)"
+    return base + f" — {(r.get('summary') or '')[:40]}"
+
+
 def _build_daily_report_prompt(records: list[dict], balance: int,
                                user_id: str | None) -> str:
-    summary_text = "\n".join(
-        f"・{r['subject_name']}「{r.get('unit') or ''}」: {r['score']}/{r['total']}問正解"
-        f" — {r['summary'][:40]}"
-        for r in records
-    )
+    summary_text = "\n".join(_format_record_score_line(r) for r in records)
     total_score = sum(r["score"] for r in records)
     total_q = sum(r["total"] for r in records)
+    total_points_earned = sum((r.get("points_earned") or 0) for r in records)
+    total_points_total = sum((r.get("points_total") or 0) for r in records)
 
     weak_block = "（データなし）"
     notes_block = "（データなし）"
@@ -1428,7 +1610,7 @@ def _build_daily_report_prompt(records: list[dict], balance: int,
 
 【本日の学習記録】
 {summary_text}
-合計: {total_score}/{total_q}問正解 / クレジット残高: {balance}
+合計: {total_score}/{total_q}問正解{f" ({total_points_earned}/{total_points_total}点)" if total_points_total > 0 else ""} / クレジット残高: {balance}
 
 【本日の所見（採点メモ抜粋）】
 {notes_block}
@@ -1500,12 +1682,15 @@ def generate_weekly_report(records: list[dict], balance: int,
     by_day: dict[str, list] = {}
     for r in records:
         by_day.setdefault(r["day"], []).append(r)
+    def _fmt_item(i: dict) -> str:
+        base = f"{i['subject_name']}「{i.get('unit') or ''}」({i['score']}/{i['total']}"
+        pt_total = i.get("points_total") or 0
+        if pt_total > 0:
+            base += f", {i.get('points_earned', 0)}/{pt_total}点"
+        return base + ")"
     summary_lines = []
     for day, items in sorted(by_day.items()):
-        subjects = "、".join(
-            f"{i['subject_name']}「{i.get('unit') or ''}」({i['score']}/{i['total']})"
-            for i in items
-        )
+        subjects = "、".join(_fmt_item(i) for i in items)
         summary_lines.append(f"{day}: {subjects}")
 
     trend_block = "（推移データなし）"
@@ -1562,6 +1747,90 @@ def generate_weekly_report(records: list[dict], balance: int,
 def load_prizes() -> list[dict]:
     with open(PRIZES_PATH, encoding="utf-8") as f:
         return json.load(f)
+
+_TIER_SECTION_TITLE = {
+    TIER_BASIC: "【基本問題】(1問 10点)",
+    TIER_APPLIED_MID: "【応用問題・中】(15点)",
+    TIER_APPLIED_HIGH: "【★チャレンジ 応用・高】(5点・解けなくてOK)",
+}
+_TIER_SECTION_ORDER = (TIER_BASIC, TIER_APPLIED_MID, TIER_APPLIED_HIGH)
+
+
+def format_child_quiz_sections(subject: dict, idx: int, total_subjects: int) -> list[str]:
+    """子向け出題テキストを tier セクション + 配点付きで整形 (SPEC §3.5.6)。
+    tier 情報が欠けている問題は末尾の「その他」セクションに入れる (後方互換)。"""
+    lines = [
+        f"【{subject['subject_name']}】({idx}/{total_subjects}科目)",
+        f"📖 {subject.get('summary', '')}\n",
+        "ノートに答えを書いて写真を送ってね！",
+    ]
+    questions = subject.get("questions") or []
+    by_tier: dict[str, list[dict]] = {t: [] for t in _TIER_SECTION_ORDER}
+    others: list[dict] = []
+    for q in questions:
+        t = q.get("tier")
+        if t in by_tier:
+            by_tier[t].append(q)
+        else:
+            others.append(q)
+    n = 0
+    for tier in _TIER_SECTION_ORDER:
+        bucket = by_tier[tier]
+        if not bucket:
+            continue
+        lines.append("")
+        lines.append(_TIER_SECTION_TITLE[tier])
+        for q in bucket:
+            n += 1
+            pts = int(q.get("points") or TIER_POINTS[tier])
+            lines.append(f"Q{n} ({pts}点). {q.get('q', '')}")
+    if others:
+        lines.append("")
+        lines.append("【その他】")
+        for q in others:
+            n += 1
+            lines.append(f"Q{n}. {q.get('q', '')}")
+    return lines
+
+
+def format_child_grading_result(subject_name: str, subject: dict,
+                                results: list[dict], outcome: dict) -> list[str]:
+    """子向け採点結果テキストを配点・encouragement 対応で整形 (SPEC §3.5.6)。"""
+    score = outcome["score"]
+    total_q = subject.get("total", len(results))
+    points_earned = outcome.get("points_earned", 0)
+    points_total = outcome.get("points_total", subject.get("points_total") or 0)
+    earned = outcome["earned"]
+    balance = outcome["balance"]
+
+    header = f"【{subject_name} 採点結果】 {score}/{total_q}問正解"
+    if points_total > 0:
+        header += f" ・ {points_earned}/{points_total}点獲得"
+    header += " 🎉\n"
+    lines = [header]
+
+    questions = subject.get("questions") or []
+    for i, r in enumerate(results, 1):
+        q = questions[i - 1] if i - 1 < len(questions) else {}
+        mark = "○" if r.get("correct") else "×"
+        tier = q.get("tier")
+        pts = int(q.get("points") or 0)
+        suffix = ""
+        if tier in VALID_TIERS and pts:
+            earned_pts = pts if r.get("correct") else 0
+            suffix = f"  ({earned_pts}/{pts}点)"
+        lines.append(f"{mark} Q{i}. {r.get('q', '')}{suffix}")
+        lines.append(f"   あなたの答え: {r.get('student_answer', '？')}")
+        # 応用・高 誤答時は encouragement を優先
+        comment = r.get("comment")
+        if tier == TIER_APPLIED_HIGH and not r.get("correct") and q.get("encouragement"):
+            comment = q["encouragement"]
+        if comment:
+            lines.append(f"   {comment}")
+        lines.append("")
+    lines.append(f"+{earned}クレジット獲得！（残高: {balance}cr）")
+    return lines
+
 
 def format_prize_catalog(prizes: list[dict], balance: int) -> str:
     lines = [f"【景品カタログ】現在の残高: {balance}クレジット\n"]
@@ -1663,22 +1932,7 @@ def handle_child(user_id: str, reply_token: str, msg: dict,
             save_learning_records(session["id"], db_uid, subjects_data)
             set_session_status(session["id"], "grading")
             for i, s in enumerate(subjects_data, 1):
-                today_qs = [q for q in s["questions"] if q.get("origin") != "review"]
-                review_qs = [q for q in s["questions"] if q.get("origin") == "review"]
-                lines = [
-                    f"【{s['subject_name']}】({i}/{len(subjects_data)}科目)",
-                    f"📖 {s.get('summary', '')}\n",
-                    "【今日のテスト】ノートに答えを書いて写真を送ってね！\n",
-                ]
-                n = 0
-                for q in today_qs:
-                    n += 1
-                    lines.append(f"Q{n}. {q['q']}")
-                if review_qs:
-                    lines.append("\n【おさらい】以前の内容からも出題！")
-                    for q in review_qs:
-                        n += 1
-                        lines.append(f"Q{n}. {q['q']}")
+                lines = format_child_quiz_sections(s, i, len(subjects_data))
                 push(user_id, "\n".join(lines))
             push(user_id, "全科目のテストを送りました！\nノートに解答を書いて、写真を送ってください📷")
 
@@ -1708,21 +1962,11 @@ def handle_child(user_id: str, reply_token: str, msg: dict,
         results = grade_answers(image_path, subject["questions"])
         outcome = finalize_grading(
             db_uid, subject["topic_id"], subject["id"],
-            subject["questions"], results, CREDIT_PER_CORRECT,
+            subject["questions"], results,
         )
-        score = outcome["score"]
-        earned = outcome["earned"]
-        balance = outcome["balance"]
-
-        lines = [f"【{subject_name} 採点結果】 {score}/{subject['total']}問正解 🎉\n"]
-        for i, r in enumerate(results, 1):
-            mark = "○" if r.get("correct") else "×"
-            lines.append(f"{mark} Q{i}. {r.get('q', '')}")
-            lines.append(f"   あなたの答え: {r.get('student_answer', '？')}")
-            if r.get("comment"):
-                lines.append(f"   {r['comment']}")
-            lines.append("")
-        lines.append(f"+{earned}クレジット獲得！（残高: {balance}cr）")
+        lines = format_child_grading_result(
+            subject_name, subject, results, outcome,
+        )
         push(user_id, "\n".join(lines))
 
         remaining = count_waiting_records(session["id"])
